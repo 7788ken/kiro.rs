@@ -946,7 +946,7 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "mysql")))]
 mod tests {
     use super::*;
 

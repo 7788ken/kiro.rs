@@ -17,9 +17,9 @@
 
 ## 用户与积分计费（本分支）
 
-本分支在原有 Kiro 凭据池之上增加独立的用户体系与积分账本，不需要 MySQL 或 Redis。用户、密码哈希、API Key 哈希、网页会话和积分流水保存在配置文件同目录的 `accounts.db`（SQLite），部署时请持久化并定期备份该文件。
+本分支在原有 Kiro 凭据池之上增加独立的用户体系与积分账本。生产环境的用户、密码哈希、API Key 哈希、网页会话和积分流水保存在 **MySQL 8.4（InnoDB）**，通过事务完成预授权、结算与退款；`config/` 仍需持久化，并定期备份 MySQL 数据库。
 
-**部署、HTTPS、升级、备份与回滚详见 [部署手册](docs/DEPLOYMENT.md)。后台视觉、组件与交互规范详见 [后台 UI / UX 设计手册](docs/ADMIN_UI_UX_GUIDE.md)。**
+**部署、HTTPS、升级、备份与回滚详见 [部署手册](docs/DEPLOYMENT.md)。MySQL 配置、数据迁移和回滚详见 [MySQL 迁移手册](docs/MYSQL_MIGRATION.md)。后台视觉、组件与交互规范详见 [后台 UI / UX 设计手册](docs/ADMIN_UI_UX_GUIDE.md)。**
 
 ### 角色与登录
 
@@ -62,7 +62,7 @@
 - `POST /api/admin/users/:id/key`：重置用户 API Key。
 - `GET|PUT /api/admin/billing`：查询或设置计费单价，仅超管可修改。
 
-Docker 部署时 `./config/:/app/config/` 挂载会同时保存 `accounts.db`。备份时应同时保存配置文件和 SQLite 数据库，不能只备份 `credentials.json`。
+Docker 部署使用 `config/` 保存服务配置和上游凭据，使用 MySQL 保存账户与账务。备份时应同时保存配置文件、凭据和 MySQL 数据库，不能只备份 `credentials.json` 或旧 `accounts.db`。
 
 后台版本检测、Kiro 上游版本调整、Profile ARN 自动发现及程序安全升级计划见 [TODO.md](TODO.md)。
 

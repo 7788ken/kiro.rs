@@ -12,11 +12,11 @@ FROM rust:1.92-alpine AS builder
 RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
-RUN cargo build --release --no-default-features
+RUN cargo build --locked --release --no-default-features --features mysql
 
 FROM alpine:3.21
 
@@ -24,6 +24,7 @@ RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
+COPY --from=builder /app/target/release/migrate /app/migrate
 
 VOLUME ["/app/config"]
 

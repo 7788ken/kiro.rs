@@ -14,12 +14,12 @@ Caddy（TLS 终止、反向代理）
 kiro-rs 容器（应用监听 0.0.0.0:6091）
   ├── config.json          服务与上游配置
   ├── credentials.json     Kiro 凭据
-  └── accounts.db          用户、角色、会话与积分账本（SQLite）
+  └── MySQL                用户、角色、会话与积分账本
 ```
 
-应用只依赖 SQLite，不需要 MySQL 或 Redis。`config/` 必须挂载到宿主机，不能仅保存在容器可写层中。
+生产环境使用 MySQL 8.4 + InnoDB，账户数据不再写入 `accounts.db`。MySQL 连接地址通过服务器上的 `.env.mysql` 提供，密码不得提交到 Git。原 SQLite 文件只用于历史备份与一次性迁移。
 
-后台页面的视觉、组件、交互与验收规则统一遵循 [后台 UI / UX 设计手册](ADMIN_UI_UX_GUIDE.md)。
+后台页面的视觉、组件、交互与验收规则统一遵循 [后台 UI / UX 设计手册](ADMIN_UI_UX_GUIDE.md)。数据库配置、SQLite 迁移和回滚详见 [MySQL 迁移手册](MYSQL_MIGRATION.md)。
 
 ## 2. 环境要求
 
@@ -272,12 +272,13 @@ backup="config/backups/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 chmod 700 "$backup"
 cp -a config/config.json config/credentials.json "$backup/"
-sqlite3 config/accounts.db ".backup '$backup/accounts.db'"
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml stop
+docker exec new-api-mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --triggers kiro_rs' > "$backup/kiro_rs.sql"
 chmod 600 "$backup"/*
-sqlite3 "$backup/accounts.db" 'PRAGMA integrity_check;'
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml start
 ```
 
-SQLite 使用 `.backup`，不要在服务写入时仅复制 `accounts.db` 而忽略 WAL。备份包含敏感信息，应限制权限并异地保存。
+MySQL 使用 `mysqldump --single-transaction` 创建一致性逻辑备份；短暂停止写入可避免备份期间继续产生账务。备份包含敏感信息，应限制权限并异地保存。原 SQLite 备份仅用于本次迁移与历史回滚，详见 [MySQL 迁移手册](MYSQL_MIGRATION.md)。
 
 ### 8.2 更新代码并构建
 
@@ -285,11 +286,13 @@ SQLite 使用 `.backup`，不要在服务写入时仅复制 `accounts.db` 而忽
 cd /opt/kiro-rs
 git fetch origin master
 git status --short
-git reset --hard origin/master
+git diff HEAD
+# 本地变更应提交到分支，或另行备份后再整合；不要直接重置服务器工作区。
+git merge --ff-only origin/master
 docker compose -f docker-compose.yml -f docker-compose.deploy.yml build
 ```
 
-`git reset --hard` 会覆盖服务器仓库内的未提交修改。若服务器也承载二次开发，先提交到独立分支，不要直接重置。`config/` 与部署文件应保留在 Git 之外。
+`config/`、`.env.mysql` 与服务器专用 `docker-compose.deploy.yml` 应保留在 Git 之外。当前使用单容器替换，停止旧容器、启动新容器期间会有短暂中断；需要无中断升级时，必须先完成 [TODO](../TODO.md) 中的蓝绿部署与健康检查改造。
 
 ### 8.3 替换并验证
 
@@ -311,22 +314,22 @@ curl -kfsS https://服务器IP:6091/admin -o /dev/null
 2. 将 `docker-compose.deploy.yml` 的 `image` 改为先前验证过的镜像 ID 或不可变 digest。
 3. 执行 `docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-build`。
 4. 验证管理页、上游凭据与最小对话。
-5. 仅在确认数据库兼容性问题需要回滚时，停止服务后恢复备份：
+5. 仅在确认数据库兼容性问题需要回滚时，停止服务后保留故障备份并恢复 MySQL：
 
 ```bash
 cd /opt/kiro-rs
 docker compose -f docker-compose.yml -f docker-compose.deploy.yml stop
 cp -a config/config.json config/config.json.failed
 cp -a config/credentials.json config/credentials.json.failed
-sqlite3 config/accounts.db ".backup 'config/accounts.db.failed'"
+docker exec new-api-mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --triggers kiro_rs' > config/backups/kiro_rs-before-restore.sql
 cp -a config/backups/备份目录/config.json config/config.json
 cp -a config/backups/备份目录/credentials.json config/credentials.json
-cp -a config/backups/备份目录/accounts.db config/accounts.db
-rm -f config/accounts.db-shm config/accounts.db-wal
+docker exec new-api-mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "DROP DATABASE kiro_rs; CREATE DATABASE kiro_rs CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"'
+docker exec -i new-api-mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" kiro_rs' < config/backups/备份目录/kiro_rs.sql
 docker compose -f docker-compose.yml -f docker-compose.deploy.yml start
 ```
 
-数据库结构若发生不兼容升级，不能盲目用旧程序读取新数据库。先保留故障副本，再按对应版本迁移策略恢复。
+恢复数据库会丢弃恢复点之后的新数据，必须先停止应用写入并保留故障副本。数据库结构若发生不兼容升级，不能盲目用旧程序读取新数据库；先保留故障副本，再按对应版本迁移策略恢复。
 
 ## 10. 常见问题
 
@@ -368,6 +371,6 @@ journalctl -u caddy --since '15 minutes ago'
 - 不把真实密钥、Token、Profile ARN、数据库或备份提交到 Git。
 - 配置目录、数据库与备份文件权限最小化。
 - 升级前备份，升级后验证，保留旧镜像直到服务稳定。
-- 定期执行 SQLite 一致性备份和 `PRAGMA integrity_check`。
+- 定期执行 MySQL 一致性备份，并定期进行恢复演练。
 - 将 `config/` 纳入备份计划，并定期进行恢复演练。
 - 网页会话与 API Key 分离，泄露时立即重置对应用户 Key。

@@ -83,6 +83,17 @@ async fn main() {
             std::process::exit(1);
         });
     let db_path = account_db_path(&config_path);
+    #[cfg(feature = "mysql")]
+    let database_url = std::env::var("MYSQL_URL").unwrap_or_else(|_| {
+        tracing::error!("MySQL 模式需要配置 MYSQL_URL 环境变量");
+        std::process::exit(1);
+    });
+    #[cfg(feature = "mysql")]
+    let account_store = AccountStore::open(&database_url).unwrap_or_else(|error| {
+        tracing::error!("连接 MySQL 账户数据库失败: {}", error);
+        std::process::exit(1);
+    });
+    #[cfg(not(feature = "mysql"))]
     let account_store = AccountStore::open(&db_path).unwrap_or_else(|error| {
         tracing::error!("打开账户数据库 {} 失败: {}", db_path.display(), error);
         std::process::exit(1);
@@ -95,6 +106,9 @@ async fn main() {
         });
     let account_state =
         AccountState::new(Arc::new(account_store), admin_key).with_legacy_api_key(legacy_api_key);
+    #[cfg(feature = "mysql")]
+    tracing::info!("用户、权限及积分账本已启用: MySQL");
+    #[cfg(not(feature = "mysql"))]
     tracing::info!("用户、权限及积分账本已启用: {}", db_path.display());
 
     let proxy_config = config.proxy_url.as_ref().map(|url| {

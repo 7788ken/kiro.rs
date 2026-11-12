@@ -10,7 +10,8 @@ use axum::{
 
 use super::{
     models::AuthUser,
-    store::{AccountError, AccountStore},
+    AccountStore,
+    store::AccountError,
 };
 use crate::{admin::types::AdminErrorResponse, anthropic::types::ErrorResponse, common::auth};
 

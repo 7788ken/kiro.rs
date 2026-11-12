@@ -1,3 +1,5 @@
+#![cfg(not(feature = "mysql"))]
+
 use std::sync::Arc;
 
 use axum::{
