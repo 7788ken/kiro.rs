@@ -13,6 +13,7 @@ services:
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
+    stop_grace_period: 1h
 
 networks:
   deploy_new-api-network:

@@ -234,9 +234,17 @@ impl Config {
             .config_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
+        let _lock = crate::shared_files::acquire(&path.with_extension("lock"))?;
+        self.save_locked()
+    }
 
+    pub fn save_locked(&self) -> anyhow::Result<()> {
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
+        crate::shared_files::atomic_write(path, &content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }

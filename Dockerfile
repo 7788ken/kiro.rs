@@ -30,4 +30,6 @@ VOLUME ["/app/config"]
 
 EXPOSE 8990
 
+STOPSIGNAL SIGTERM
+
 CMD ["./kiro-rs", "-c", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]

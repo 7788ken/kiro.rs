@@ -5,7 +5,9 @@ mod anthropic;
 mod common;
 mod http_client;
 mod kiro;
+mod lifecycle;
 mod model;
+mod shared_files;
 pub mod token;
 
 use std::collections::HashMap;
@@ -175,7 +177,9 @@ async fn main() {
         accounts::middleware::super_admin_auth_middleware,
     ));
 
+    let lifecycle = lifecycle::Lifecycle::default();
     let app = Router::new()
+        .merge(lifecycle::router(lifecycle.clone()))
         .merge(anthropic_app)
         .nest(
             "/api/account",
@@ -203,7 +207,10 @@ async fn main() {
     tracing::info!("API 端点: /v1/messages、/cc/v1/messages");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(lifecycle::shutdown_signal(lifecycle))
+        .await
+        .unwrap();
 }
 
 fn account_db_path(config_path: &str) -> PathBuf {

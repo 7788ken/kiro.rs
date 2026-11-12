@@ -64,6 +64,8 @@
 
 Docker 部署使用 `config/` 保存服务配置和上游凭据，使用 MySQL 保存账户与账务。备份时应同时保存配置文件、凭据和 MySQL 数据库，不能只备份 `credentials.json` 或旧 `accounts.db`。
 
+生产升级使用蓝绿无感部署：`deploy/blue_green.py deploy --env deployment.env`。候选实例通过健康检查和真实流式调用后切流，旧实例等待存量响应结束后退出；提供健康检查、备份、失败回滚和排空状态。服务器配置示例见 `deploy/deployment.example.env`，完整步骤见部署手册。
+
 后台版本检测、Kiro 上游版本调整、Profile ARN 自动发现及程序安全升级计划见 [TODO.md](TODO.md)。
 
 ---

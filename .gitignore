@@ -17,3 +17,5 @@
 /config/
 /.env.mysql
 /.env.*
+/deployment.env
+/deploy-state/

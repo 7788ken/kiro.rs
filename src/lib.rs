@@ -5,5 +5,7 @@ pub mod anthropic;
 pub mod common;
 pub mod http_client;
 pub mod kiro;
+pub mod lifecycle;
 pub mod model;
+pub mod shared_files;
 pub mod token;

@@ -8,10 +8,10 @@
 客户端
   │ HTTPS :6091
   ▼
-Caddy（TLS 终止、反向代理）
-  │ HTTP 127.0.0.1:16091
+Caddy（TLS 终止、反向代理、蓝绿切流）
+  │ HTTP 容器 IP:6091（本机 16091 / 16092 仅用于检查）
   ▼
-kiro-rs 容器（应用监听 0.0.0.0:6091）
+kiro-rs 蓝 / 绿容器（共享配置和 MySQL）
   ├── config.json          服务与上游配置
   ├── credentials.json     Kiro 凭据
   └── MySQL                用户、角色、会话与积分账本
@@ -262,74 +262,73 @@ journalctl -u caddy --since '15 minutes ago' --no-pager
 - 密码登录不会轮换 API Key，退出后网页会话失效。
 - 至少进行一次真实最小对话，确认上游凭据和协议转换正常。
 
-## 8. 升级部署
+## 8. 蓝绿无感升级
 
-### 8.1 先备份
+生产升级使用 `deploy/blue_green.py`，**不得再用单容器 `docker compose up -d` 直接替换活跃服务**。蓝绿流程会：
+
+1. 保留旧实例与流量，构建并启动另一颜色的候选实例。
+2. 检查 `/health/live`、`/health/ready`、管理页、MySQL 预授权状态，并用专用测试 Key 执行最小真实流式请求。
+3. 通过 Caddy 管理 API 的 `ETag` / `If-Match` 原子替换 `@id kiro_rs_active` 的 upstream，避免并发覆盖。
+4. 切流后再次验收。失败时立即恢复旧 upstream，旧实例未通过验收前不会停止。
+5. 旧实例收到 `SIGTERM` 后停止接收新连接，等待在途响应体（包括 SSE）完成，再退出并清理。
+
+### 8.1 Caddy 配置与持久化
+
+- Caddy 管理 API 只监听 `127.0.0.1:2019`，不能暴露公网。
+- 使用系统 `caddy-api.service`，以 `caddy run --resume` 恢复管理 API 的最新配置。普通 `caddy.service` 从 Caddyfile 启动，会丢失 API 切流状态，不能混用。
+- 目标代理 handler 必须带 `@id kiro_rs_active`，脚本只修改这个 handler 的 upstream，不操作其他站点。
+- 当前 Caddyfile 仍是人工审计和紧急恢复参考；管理 API 配置保存在 Caddy 的 autosave 文件中。修改 Caddyfile 后通过 API `/load` 加载，不要在生产直接重启代理。
+
+### 8.2 服务器本地配置
+
+复制 `deploy/deployment.example.env` 为 `/opt/kiro-rs/deployment.env`，填写服务器路径、镜像、网络、端口和专用测试 Key，权限设为 `600`。该文件与 `.env.mysql`、真实凭据和数据库备份均不提交 Git。
+
+```bash
+chmod 600 /opt/kiro-rs/deployment.env /opt/kiro-rs/.env.mysql
+python3 /opt/kiro-rs/deploy/blue_green.py status --env /opt/kiro-rs/deployment.env
+```
+
+### 8.3 备份并升级
+
+部署脚本会先在旧实例服务期间备份 `config.json`、`credentials.json` 和 MySQL 一致性快照，再构建候选实例。也可以先手动检查备份目录：
+
+```bash
+ls -ld config/backups/blue-green-*
+```
 
 ```bash
 cd /opt/kiro-rs
-backup="config/backups/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$backup"
-chmod 700 "$backup"
-cp -a config/config.json config/credentials.json "$backup/"
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml stop
-docker exec new-api-mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --triggers kiro_rs' > "$backup/kiro_rs.sql"
-chmod 600 "$backup"/*
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml start
+python3 deploy/blue_green.py deploy --env deployment.env
 ```
 
-MySQL 使用 `mysqldump --single-transaction` 创建一致性逻辑备份；短暂停止写入可避免备份期间继续产生账务。备份包含敏感信息，应限制权限并异地保存。原 SQLite 备份仅用于本次迁移与历史回滚，详见 [MySQL 迁移手册](MYSQL_MIGRATION.md)。
+MySQL 备份使用 `--single-transaction`，不需要为了蓝绿升级停止应用。`deploy-state/active.json` 记录活跃实例、候选、镜像 ID 和阶段，权限为 `600`。`deploy.lock` 防止并发部署。
 
-### 8.2 更新代码并构建
+数据库变更必须遵守“扩展 → 新旧版本兼容 → 收缩”。破坏性迁移或不可逆迁移不得在蓝绿过程中执行；此类维护需要单独的数据迁移与回滚方案。
+
+### 8.4 排空、回滚与故障恢复
+
+- `status`：查看活跃实例、候选、退役实例及 Caddy upstream。
+- `rollback`：仅在上一实例尚未排空、仍能通过就绪与真实调用检查时切回；随后优雅排空当前实例。不能恢复已停止或已删除的实例。
+- `cleanup`：继续等待旧实例优雅退出，再清理已停止容器；不会强制结束活跃流。
+- 候选启动或验收失败：不切流，保留旧实例。候选容器保留用于排查。
+- 切流后验收失败：恢复旧 upstream，并重新验收旧实例。
+- 旧实例排空超时：状态为 `awaiting_drain`，旧容器保留。不能为了“完成部署”使用 `docker kill`、`docker rm -f` 或强制清理。
 
 ```bash
-cd /opt/kiro-rs
-git fetch origin master
-git status --short
-git diff HEAD
-# 本地变更应提交到分支，或另行备份后再整合；不要直接重置服务器工作区。
-git merge --ff-only origin/master
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml build
+python3 deploy/blue_green.py status --env deployment.env
+python3 deploy/blue_green.py rollback --env deployment.env
+python3 deploy/blue_green.py cleanup --env deployment.env
 ```
 
-`config/`、`.env.mysql` 与服务器专用 `docker-compose.deploy.yml` 应保留在 Git 之外。当前使用单容器替换，停止旧容器、启动新容器期间会有短暂中断；需要无中断升级时，必须先完成 [TODO](../TODO.md) 中的蓝绿部署与健康检查改造。
-
-### 8.3 替换并验证
+手动恢复时，先检查状态文件、容器和 Caddy upstream 是否一致，不要盲目重建或删除实例。Caddy 管理 API 支持：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-build
-docker ps --filter name=^/kiro-rs$
-docker logs --tail 100 kiro-rs
-curl -fsS http://127.0.0.1:16091/admin -o /dev/null
-curl -kfsS https://服务器IP:6091/admin -o /dev/null
+curl http://127.0.0.1:2019/id/kiro_rs_active/upstreams
+curl http://127.0.0.1:16091/health/ready
+curl http://127.0.0.1:16092/health/ready
 ```
 
-检查用户列表、原凭据、余额和流水，再执行一次最小对话。通过前不要删除旧镜像和备份。
-
-## 9. 回滚
-
-若新容器未启动或验收失败：
-
-1. 记录失败日志，保留当前容器和镜像以便排查。
-2. 将 `docker-compose.deploy.yml` 的 `image` 改为先前验证过的镜像 ID 或不可变 digest。
-3. 执行 `docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-build`。
-4. 验证管理页、上游凭据与最小对话。
-5. 仅在确认数据库兼容性问题需要回滚时，停止服务后保留故障备份并恢复 MySQL：
-
-```bash
-cd /opt/kiro-rs
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml stop
-cp -a config/config.json config/config.json.failed
-cp -a config/credentials.json config/credentials.json.failed
-docker exec new-api-mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --triggers kiro_rs' > config/backups/kiro_rs-before-restore.sql
-cp -a config/backups/备份目录/config.json config/config.json
-cp -a config/backups/备份目录/credentials.json config/credentials.json
-docker exec new-api-mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "DROP DATABASE kiro_rs; CREATE DATABASE kiro_rs CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"'
-docker exec -i new-api-mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" kiro_rs' < config/backups/备份目录/kiro_rs.sql
-docker compose -f docker-compose.yml -f docker-compose.deploy.yml start
-```
-
-恢复数据库会丢弃恢复点之后的新数据，必须先停止应用写入并保留故障副本。数据库结构若发生不兼容升级，不能盲目用旧程序读取新数据库；先保留故障副本，再按对应版本迁移策略恢复。
+数据库恢复可能丢弃新写入，不等同于应用无感回滚。只有在确认需要回退数据时，才停止写入、保留故障副本并按 MySQL 迁移手册恢复。
 
 ## 10. 常见问题
 

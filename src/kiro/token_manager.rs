@@ -399,6 +399,7 @@ struct CredentialEntry {
     id: u64,
     /// 凭据信息
     credentials: KiroCredentials,
+    persisted: Option<KiroCredentials>,
     /// API 调用连续失败次数
     failure_count: u32,
     /// Token 刷新连续失败次数
@@ -431,7 +432,7 @@ enum DisabledReason {
 }
 
 /// 统计数据持久化条目
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
@@ -586,6 +587,7 @@ impl MultiTokenManager {
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
+                    persisted: Some(cred.clone()),
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
@@ -926,7 +928,7 @@ impl MultiTokenManager {
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                                                entry.credentials = new_creds.clone();
                     }
                 }
 
@@ -987,30 +989,43 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
+        let _lock = crate::shared_files::acquire(&path.with_extension("lock"))?;
+        let disk = std::fs::read_to_string(path)
+            .ok()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| serde_json::from_str::<Vec<KiroCredentials>>(&content))
+            .transpose()
+            .context("读取共享凭据快照失败")?
+            .unwrap_or_default();
+        let (local, snapshots): (Vec<KiroCredentials>, HashMap<u64, Option<KiroCredentials>>) = {
             let entries = self.entries.lock();
-            entries
+            let local = entries
                 .iter()
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
                     cred
                 })
-                .collect()
+                .collect();
+            let snapshots = entries
+                .iter()
+                .filter_map(|e| e.persisted.clone().map(|cred| (e.id, Some(cred))))
+                .collect();
+            (local, snapshots)
         };
+        let merged = crate::shared_files::merge_credentials(&local, &snapshots, disk)?;
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = serde_json::to_string_pretty(&merged).context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| crate::shared_files::atomic_write(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            crate::shared_files::atomic_write(path, &json)
+                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1069,6 +1084,13 @@ impl MultiTokenManager {
         };
 
         let stats: HashMap<String, StatsEntry> = {
+            let _lock = match crate::shared_files::acquire(&path.with_extension("lock")) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    tracing::warn!("获取统计文件锁失败: {}", error);
+                    return;
+                }
+            };
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -1086,7 +1108,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = crate::shared_files::atomic_write(&path, &json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1470,7 +1492,8 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = disabled;
+                        entry.disabled = disabled;
+                        entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
@@ -1496,7 +1519,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.priority = priority;
+                        entry.credentials.priority = priority;
         }
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
@@ -1516,7 +1539,7 @@ impl MultiTokenManager {
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
-            entry.failure_count = 0;
+                        entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
@@ -1567,7 +1590,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                                                        entry.credentials = new_creds.clone();
                         }
                     }
                     // 持久化失败只记录警告，不影响本次请求
@@ -1609,7 +1632,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
+                                                entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1747,7 +1770,8 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
                 id: new_id,
-                credentials: validated_cred,
+                credentials: validated_cred.clone(),
+                persisted: None,
                 failure_count: 0,
                 refresh_failure_count: 0,
                 disabled: false,
@@ -1855,7 +1879,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
+                                entry.credentials = new_creds;
                 entry.refresh_failure_count = 0;
             }
         }
@@ -1885,11 +1909,12 @@ impl MultiTokenManager {
             }
         };
 
+        let _lock = crate::shared_files::acquire(&config_path.with_extension("lock"))?;
         let mut config = Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.load_balancing_mode = mode.to_string();
         config
-            .save()
+            .save_locked()
             .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
 
         Ok(())
@@ -2297,6 +2322,40 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn persist_credentials_merges_concurrent_changes_and_deletions() {
+        let path = std::env::temp_dir().join(format!("kiro-credentials-{}.json", uuid::Uuid::new_v4()));
+        let original = KiroCredentials {
+            id: Some(1),
+            access_token: Some("old-token".into()),
+            refresh_token: Some("old-refresh".into()),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&vec![original.clone()]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![original.clone()],
+            None,
+            Some(path.clone()),
+            true,
+        ).unwrap();
+        let mut other = original.clone();
+        other.access_token = Some("other-token".into());
+        other.refresh_token = Some("other-refresh".into());
+        other.id = Some(2);
+        std::fs::write(&path, serde_json::to_string(&vec![other]).unwrap()).unwrap();
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+        let disk: Vec<KiroCredentials> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.len(), 2);
+        assert!(disk.iter().any(|cred| cred.id == Some(2)));
+        assert!(disk.iter().any(|cred| cred.access_token.as_deref() == Some("other-token")));
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        let _ = std::fs::remove_file(path.with_file_name("kiro_stats.json"));
+        let _ = std::fs::remove_file(path.with_file_name("kiro_stats.lock"));
     }
 
     #[tokio::test]
