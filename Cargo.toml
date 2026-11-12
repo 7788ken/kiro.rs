@@ -12,7 +12,7 @@ lto = true
 strip = true
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -36,3 +36,10 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+rusqlite = { version = "0.37", features = ["bundled"] }
+argon2 = "0.5"
+tower = { version = "0.5", features = ["util"] }
+async-stream = "0.3"
+http-body-util = "0.1"
+http-body = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }

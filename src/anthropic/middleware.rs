@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::{accounts::AccountState, common::auth};
 
 use super::types::ErrorResponse;
 
@@ -25,6 +25,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 账户服务，用于用户鉴权和积分计费
+    pub accounts: Option<AccountState>,
 }
 
 impl AppState {
@@ -34,12 +36,18 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            accounts: None,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn with_accounts(mut self, accounts: AccountState) -> Self {
+        self.accounts = Some(accounts);
         self
     }
 }
@@ -50,11 +58,29 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+    if let Some(accounts) = state.accounts {
+        let Some(key) = auth::extract_api_key(&request) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::authentication_error()),
+            )
+                .into_response();
+        };
+        match crate::accounts::middleware::authenticate_api_key(&accounts, &key).await {
+            Ok(user) => {
+                let mut request = request;
+                request.extensions_mut().insert(user);
+                next.run(request).await
+            }
+            Err(response) => response,
+        }
+    } else {
+        match auth::extract_api_key(&request) {
+            Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+            _ => {
+                let error = ErrorResponse::authentication_error();
+                (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            }
         }
     }
 }

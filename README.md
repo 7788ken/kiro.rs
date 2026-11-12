@@ -15,6 +15,52 @@
 
 ---
 
+## 用户与积分计费（本分支）
+
+本分支在原有 Kiro 凭据池之上增加独立的用户体系与积分账本，不需要 MySQL 或 Redis。用户、密码哈希、API Key 哈希、网页会话和积分流水保存在配置文件同目录的 `accounts.db`（SQLite），部署时请持久化并定期备份该文件。
+
+### 角色与登录
+
+| 角色 | 能力 |
+|------|------|
+| 超级管理员 | 管理管理员和用户、调整积分、设置计费单价、管理上游 Kiro 凭据 |
+| 管理员 | 创建和管理普通用户、调整普通用户积分、查看用户流水 |
+| 用户 | 使用独立 API Key 调用 API、查看自己的余额和流水、修改密码与轮换 Key |
+
+原 `adminApiKey` 自动初始化名为 `superadmin` 的超管账户，初始密码与该密钥相同。首次使用后建议在「安全与设置」中修改密码。也可以直接使用原管理员密钥登录。
+
+密码登录使用 12 小时网页会话，**不会轮换正在使用的 API Key**。API Key 只在创建、主动重置或修改密码时完整展示一次，数据库不保存明文 Key。密码登录入口为 `POST /api/account/login`，退出为 `POST /api/account/logout`。
+
+### 计费与账务
+
+- 默认每百万输入 token 收取 **10 积分**，每百万输出 token 收取 **50 积分**，超管可在页面修改。
+- 积分内部使用百万分之一精度，界面支持小数充值与扣减。
+- 普通用户请求先按估算输入和 `max_tokens` 预授权，成功后按响应 usage 结算，多余部分退回。
+- 上游失败或客户端中断时退回预授权；同一请求只结算一次。
+- 预授权保存单价快照，修改单价不会影响正在执行的请求。
+- 余额不足返回 `402`，不会调用上游；管理角色不扣用户积分。
+- token 统计依赖代理返回的 usage；输入和输出统计口径与原有代理一致。
+
+充值和扣减通过「用户管理 → 调整积分」完成：正数充值，负数扣减，所有变动均有流水。禁止管理员给自己调积分，超管不能通过普通管理接口删除自己或修改为低权限角色。
+
+### 账户 API
+
+- `GET /api/account/me`：个人账户、余额与用量概览。
+- `GET /api/account/transactions?userId=&limit=`：流水；普通用户始终只能查询本人。
+- `POST /api/account/password`：修改密码并轮换 API Key。
+- `POST /api/account/key`：轮换自己的 API Key。
+- `GET|POST /api/admin/users`：用户列表与创建用户。
+- `PUT /api/admin/users/:id`：启停用户或修改角色。
+- `POST /api/admin/users/:id/credits`：调整积分。
+- `POST /api/admin/users/:id/key`：重置用户 API Key。
+- `GET|PUT /api/admin/billing`：查询或设置计费单价，仅超管可修改。
+
+Docker 部署时 `./config/:/app/config/` 挂载会同时保存 `accounts.db`。备份时应同时保存配置文件和 SQLite 数据库，不能只备份 `credentials.json`。
+
+后台版本检测、Kiro 上游版本调整、Profile ARN 自动发现及程序安全升级计划见 [TODO.md](TODO.md)。
+
+---
+
 #### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
 
 ## 免责声明

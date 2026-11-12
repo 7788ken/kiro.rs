@@ -41,7 +41,11 @@ pub async fn admin_auth_middleware(
     let api_key = auth::extract_api_key(&request);
 
     match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
+        Some(key)
+            if auth::constant_time_eq(&key, &state.admin_api_key) || key.starts_with("sk-usr-") =>
+        {
+            next.run(request).await
+        }
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

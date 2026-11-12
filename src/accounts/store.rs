@@ -1,0 +1,950 @@
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use chrono::Utc;
+use parking_lot::Mutex;
+use rand_core::OsRng;
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use super::models::{
+    AccountOverview, AuthUser, BillingConfig, MICRO_CREDITS, Reservation, Role, TransactionView,
+    UserView,
+};
+
+#[derive(Debug)]
+pub enum AccountError {
+    InvalidInput(String),
+    NotFound,
+    Conflict(String),
+    Forbidden(String),
+    InsufficientCredits {
+        required_micro: i64,
+        balance_micro: i64,
+    },
+    Internal(String),
+}
+
+impl std::fmt::Display for AccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(message)
+            | Self::Conflict(message)
+            | Self::Forbidden(message)
+            | Self::Internal(message) => f.write_str(message),
+            Self::NotFound => f.write_str("用户不存在"),
+            Self::InsufficientCredits { .. } => f.write_str("积分余额不足"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for AccountError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Internal(format!("账户数据库错误: {error}"))
+    }
+}
+
+pub struct AccountStore {
+    connection: Mutex<Connection>,
+}
+
+impl AccountStore {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, AccountError> {
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                api_key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('super_admin', 'admin', 'user')),
+                balance_micro INTEGER NOT NULL DEFAULT 0 CHECK (balance_micro >= 0),
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS billing_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                input_per_million REAL NOT NULL,
+                output_per_million REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS credit_transactions (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                actor_id INTEGER REFERENCES users(id),
+                kind TEXT NOT NULL,
+                amount_micro INTEGER NOT NULL,
+                balance_after_micro INTEGER NOT NULL,
+                model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reserved_micro INTEGER NOT NULL DEFAULT 0,
+                input_rate REAL NOT NULL DEFAULT 10.0,
+                output_rate REAL NOT NULL DEFAULT 50.0,
+                status TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_transactions_user ON credit_transactions(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_transactions_pending ON credit_transactions(status) WHERE status = 'pending';
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                expires_at TEXT NOT NULL
+            );",
+        )?;
+        let store = Self {
+            connection: Mutex::new(connection),
+        };
+        let connection = store.connection.lock();
+        connection.execute(
+            "INSERT OR IGNORE INTO billing_config VALUES (1, 10.0, 50.0)",
+            [],
+        )?;
+        drop(connection);
+        Ok(store)
+    }
+
+    pub fn ensure_super_admin(&self, admin_key: &str) -> Result<(), AccountError> {
+        let connection = self.connection.lock();
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'super_admin')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                "INSERT INTO users (username, password_hash, api_key_hash, key_prefix, role, created_at)
+                 VALUES ('superadmin', ?1, ?2, ?3, 'super_admin', ?4)",
+                params![
+                    hash_password(admin_key)?,
+                    key_hash(admin_key),
+                    key_prefix(admin_key),
+                    now()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn super_admin(&self) -> Result<AuthUser, AccountError> {
+        let connection = self.connection.lock();
+        connection.query_row(
+            "SELECT id, username, role, balance_micro, enabled FROM users WHERE role = 'super_admin' ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(AuthUser { id: row.get(0)?, username: row.get(1)?, role: Role::SuperAdmin, balance_micro: row.get(3)?, enabled: row.get::<_, i64>(4)? != 0 }),
+        ).optional()?.filter(|user| user.enabled).ok_or_else(|| AccountError::Internal("超级管理员未初始化或已禁用".into()))
+    }
+
+    pub fn authenticate_key(&self, key: &str) -> Result<Option<AuthUser>, AccountError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, username, role, balance_micro, enabled FROM users WHERE api_key_hash = ?1",
+        )?;
+        let result = statement
+            .query_row([key_hash(key)], |row| {
+                Ok(AuthUser {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
+                    balance_micro: row.get(3)?,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(result.filter(|user| user.enabled))
+    }
+
+    pub fn authenticate_password(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<AuthUser>, AccountError> {
+        let connection = self.connection.lock();
+        let result = connection
+            .query_row(
+                "SELECT id, username, password_hash, role, balance_micro, enabled FROM users WHERE username = ?1",
+                [username.trim()],
+                |row| {
+                    Ok((
+                        AuthUser {
+                            id: row.get(0)?,
+                            username: row.get(1)?,
+                            role: Role::parse(&row.get::<_, String>(3)?).unwrap_or(Role::User),
+                            balance_micro: row.get(4)?,
+                            enabled: row.get::<_, i64>(5)? != 0,
+                        },
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match result {
+            Some((user, hash))
+                if user.enabled && verify_password(password, &hash).unwrap_or(false) =>
+            {
+                Ok(Some(user))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn create_web_session(&self, user: &AuthUser) -> Result<String, AccountError> {
+        let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
+        let connection = self.connection.lock();
+        connection.execute("DELETE FROM web_sessions WHERE expires_at <= ?1", [now()])?;
+        connection.execute(
+            "INSERT INTO web_sessions VALUES (?1, ?2, ?3)",
+            params![
+                key_hash(&token),
+                user.id,
+                (Utc::now() + chrono::Duration::hours(12)).to_rfc3339()
+            ],
+        )?;
+        Ok(token)
+    }
+
+    pub fn authenticate_web_session(&self, token: &str) -> Result<Option<AuthUser>, AccountError> {
+        let connection = self.connection.lock();
+        let user_id = connection
+            .query_row(
+                "SELECT user_id FROM web_sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                params![key_hash(token), now()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match user_id {
+            Some(id) => {
+                let user = get_user(&connection, id)?;
+                Ok(user.enabled.then_some(user))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn revoke_web_session(&self, token: &str) -> Result<(), AccountError> {
+        let connection = self.connection.lock();
+        connection.execute(
+            "DELETE FROM web_sessions WHERE token_hash = ?1",
+            [key_hash(token)],
+        )?;
+        Ok(())
+    }
+
+    pub fn authenticate_session(&self, user_id: i64) -> Result<AuthUser, AccountError> {
+        let connection = self.connection.lock();
+        get_user(&connection, user_id).and_then(|user| {
+            if user.enabled {
+                Ok(user)
+            } else {
+                Err(AccountError::Forbidden("账户已被禁用".into()))
+            }
+        })
+    }
+
+    pub fn change_password(
+        &self,
+        user: &AuthUser,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<String, AccountError> {
+        validate_password(new_password)?;
+        let connection = self.connection.lock();
+        let current_hash: String = connection.query_row(
+            "SELECT password_hash FROM users WHERE id = ?1",
+            [user.id],
+            |row| row.get(0),
+        )?;
+        if !verify_password(current_password, &current_hash)? {
+            return Err(AccountError::Forbidden("当前密码不正确".into()));
+        }
+        let api_key = generate_api_key();
+        connection.execute(
+            "UPDATE users SET password_hash = ?1, api_key_hash = ?2, key_prefix = ?3 WHERE id = ?4",
+            params![
+                hash_password(new_password)?,
+                key_hash(&api_key),
+                key_prefix(&api_key),
+                user.id
+            ],
+        )?;
+        Ok(api_key)
+    }
+
+    pub fn create_user(
+        &self,
+        actor: &AuthUser,
+        username: &str,
+        password: &str,
+        role: Role,
+        initial_balance: f64,
+    ) -> Result<(UserView, String), AccountError> {
+        if !actor.role.can_manage(role) {
+            return Err(AccountError::Forbidden("无权创建该角色的账户".into()));
+        }
+        let username = username.trim();
+        if username.len() < 3
+            || username.len() > 40
+            || !username
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@'))
+        {
+            return Err(AccountError::InvalidInput(
+                "用户名需为 3-40 位字母、数字或 _ - . @".into(),
+            ));
+        }
+        validate_password(password)?;
+        let amount = credits_to_micro(initial_balance)?;
+        let api_key = generate_api_key();
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        let result = transaction.execute(
+            "INSERT INTO users (username, password_hash, api_key_hash, key_prefix, role, balance_micro, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![username, hash_password(password)?, key_hash(&api_key), key_prefix(&api_key), role.as_str(), amount, now()],
+        );
+        if let Err(error) = result {
+            return if error.to_string().contains("UNIQUE") {
+                Err(AccountError::Conflict("用户名已存在".into()))
+            } else {
+                Err(error.into())
+            };
+        }
+        let id = transaction.last_insert_rowid();
+        if amount > 0 {
+            insert_transaction(
+                &transaction,
+                id,
+                Some(actor.id),
+                "initial",
+                amount,
+                amount,
+                "settled",
+                Some("开户初始积分"),
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok((self.get_user_view(id)?, api_key))
+    }
+
+    pub fn list_users(&self, actor: &AuthUser) -> Result<Vec<UserView>, AccountError> {
+        if !actor.is_manager() {
+            return Err(AccountError::Forbidden("仅管理员可以查看用户列表".into()));
+        }
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, username, role, balance_micro, enabled, key_prefix, created_at FROM users ORDER BY id",
+        )?;
+        let rows = statement.query_map([], user_view_row)?;
+        let mut users = Vec::new();
+        for row in rows {
+            let mut user = row?;
+            if actor.role == Role::Admin && user.role != Role::User && user.id != actor.id {
+                continue;
+            }
+            add_usage(&connection, &mut user)?;
+            users.push(user);
+        }
+        Ok(users)
+    }
+
+    pub fn get_user_view(&self, id: i64) -> Result<UserView, AccountError> {
+        let connection = self.connection.lock();
+        let mut user = connection.query_row(
+            "SELECT id, username, role, balance_micro, enabled, key_prefix, created_at FROM users WHERE id = ?1",
+            [id],
+            user_view_row,
+        ).optional()?.ok_or(AccountError::NotFound)?;
+        add_usage(&connection, &mut user)?;
+        Ok(user)
+    }
+
+    pub fn update_user(
+        &self,
+        actor: &AuthUser,
+        id: i64,
+        enabled: Option<bool>,
+        role: Option<Role>,
+    ) -> Result<UserView, AccountError> {
+        let target = self.get_user_view(id)?;
+        if actor.id == id && (enabled == Some(false) || role.is_some_and(|r| r != actor.role)) {
+            return Err(AccountError::InvalidInput(
+                "不能禁用自己的账户或修改自己的角色".into(),
+            ));
+        }
+        if !actor.role.can_manage(target.role)
+            || role.is_some_and(|new_role| !actor.role.can_manage(new_role))
+        {
+            return Err(AccountError::Forbidden("无权修改该账户或角色".into()));
+        }
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE users SET enabled = COALESCE(?1, enabled), role = COALESCE(?2, role) WHERE id = ?3",
+            params![enabled.map(|v| v as i64), role.map(|r| r.as_str()), id],
+        )?;
+        drop(connection);
+        self.get_user_view(id)
+    }
+
+    pub fn regenerate_key(&self, actor: &AuthUser, id: i64) -> Result<String, AccountError> {
+        let target = self.get_user_view(id)?;
+        if actor.id != id && !actor.role.can_manage(target.role) {
+            return Err(AccountError::Forbidden("无权重置该账户的 API Key".into()));
+        }
+        let api_key = generate_api_key();
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE users SET api_key_hash = ?1, key_prefix = ?2 WHERE id = ?3",
+            params![key_hash(&api_key), key_prefix(&api_key), id],
+        )?;
+        Ok(api_key)
+    }
+
+    pub fn adjust_credits(
+        &self,
+        actor: &AuthUser,
+        id: i64,
+        amount: f64,
+        note: Option<&str>,
+    ) -> Result<UserView, AccountError> {
+        if actor.id == id {
+            return Err(AccountError::Forbidden(
+                "不能调整自己的积分，请由其他管理员操作".into(),
+            ));
+        }
+        let target = self.get_user_view(id)?;
+        if !actor.role.can_manage(target.role) {
+            return Err(AccountError::Forbidden("无权调整该账户的积分".into()));
+        }
+        let delta = credits_to_micro(amount)?;
+        if delta == 0 {
+            return Err(AccountError::InvalidInput("调整数量不能为零".into()));
+        }
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE users SET balance_micro = balance_micro + ?1 WHERE id = ?2 AND balance_micro + ?1 >= 0",
+            params![delta, id],
+        )?;
+        if changed == 0 {
+            return Err(AccountError::InsufficientCredits {
+                required_micro: -delta,
+                balance_micro: target.balance_micro,
+            });
+        }
+        let balance: i64 = transaction.query_row(
+            "SELECT balance_micro FROM users WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        insert_transaction(
+            &transaction,
+            id,
+            Some(actor.id),
+            "adjustment",
+            delta,
+            balance,
+            "settled",
+            note,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_user_view(id)
+    }
+
+    pub fn get_billing_config(&self) -> Result<BillingConfig, AccountError> {
+        let connection = self.connection.lock();
+        Ok(connection.query_row(
+            "SELECT input_per_million, output_per_million FROM billing_config WHERE id = 1",
+            [],
+            |row| {
+                Ok(BillingConfig {
+                    input_per_million: row.get(0)?,
+                    output_per_million: row.get(1)?,
+                })
+            },
+        )?)
+    }
+
+    pub fn set_billing_config(&self, config: &BillingConfig) -> Result<(), AccountError> {
+        for price in [config.input_per_million, config.output_per_million] {
+            if !price.is_finite() || !(0.0..=1_000_000_000.0).contains(&price) {
+                return Err(AccountError::InvalidInput(
+                    "单价必须在 0 至 1,000,000,000 积分/百万 token 之间".into(),
+                ));
+            }
+        }
+        let connection = self.connection.lock();
+        connection.execute("UPDATE billing_config SET input_per_million = ?1, output_per_million = ?2 WHERE id = 1", params![config.input_per_million, config.output_per_million])?;
+        Ok(())
+    }
+
+    pub fn overview(&self, user: &AuthUser) -> Result<AccountOverview, AccountError> {
+        let user = self.authenticate_session(user.id)?;
+        let connection = self.connection.lock();
+        let (input, output, spent): (i64, i64, i64) = connection.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(-amount_micro), 0)
+             FROM credit_transactions WHERE user_id = ?1 AND kind = 'charge' AND status = 'settled'",
+            [user.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let pending_count = connection.query_row(
+            "SELECT COUNT(*) FROM credit_transactions WHERE user_id = ?1 AND status = 'pending'",
+            [user.id],
+            |row| row.get(0),
+        )?;
+        drop(connection);
+        Ok(AccountOverview {
+            user,
+            total_input_tokens: input,
+            total_output_tokens: output,
+            total_spent_micro: spent,
+            pending_count,
+            billing: self.get_billing_config()?,
+        })
+    }
+
+    pub fn list_transactions(
+        &self,
+        actor: &AuthUser,
+        requested_user: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<TransactionView>, AccountError> {
+        let user_id = if actor.is_manager() {
+            requested_user
+        } else {
+            Some(actor.id)
+        };
+        let connection = self.connection.lock();
+        let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model,
+                   t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at
+                   FROM credit_transactions t JOIN users u ON u.id = t.user_id ";
+        let order = " ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?1";
+        let mut rows = Vec::new();
+        if let Some(user_id) = user_id {
+            let mut statement = connection.prepare(&format!("{sql}WHERE t.user_id = ?2{order}"))?;
+            let results =
+                statement.query_map(params![limit.min(500) as i64, user_id], transaction_row)?;
+            for row in results {
+                rows.push(row?);
+            }
+        } else {
+            let mut statement = connection.prepare(&format!("{sql}{order}"))?;
+            let results = statement.query_map([limit.min(500) as i64], transaction_row)?;
+            for row in results {
+                rows.push(row?);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn reserve(
+        &self,
+        user: &AuthUser,
+        model: &str,
+        estimated_input: i64,
+        output_limit: i64,
+    ) -> Result<Option<Reservation>, AccountError> {
+        if user.is_manager() {
+            return Ok(None);
+        }
+        if estimated_input < 0 || output_limit <= 0 {
+            return Err(AccountError::InvalidInput("max_tokens 必须为正数".into()));
+        }
+        let billing = self.get_billing_config()?;
+        let amount = billing.cost_micro(estimated_input, output_limit);
+        let id = format!("req_{}", Uuid::new_v4().simple());
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE users SET balance_micro = balance_micro - ?1 WHERE id = ?2 AND enabled = 1 AND balance_micro >= ?1",
+            params![amount, user.id],
+        )?;
+        if changed == 0 {
+            let balance = transaction
+                .query_row(
+                    "SELECT balance_micro FROM users WHERE id = ?1",
+                    [user.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(AccountError::NotFound)?;
+            return Err(AccountError::InsufficientCredits {
+                required_micro: amount,
+                balance_micro: balance,
+            });
+        }
+        let balance: i64 = transaction.query_row(
+            "SELECT balance_micro FROM users WHERE id = ?1",
+            [user.id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at)
+             VALUES (?1, ?2, 'reserve', ?3, ?4, ?5, ?6, ?7, ?3, ?9, ?10, 'pending', ?8)",
+            params![id, user.id, -amount, balance, model, estimated_input, output_limit, now(), billing.input_per_million, billing.output_per_million],
+        )?;
+        transaction.commit()?;
+        Ok(Some(Reservation {
+            id,
+            user_id: user.id,
+            amount_micro: amount,
+            input_tokens: estimated_input,
+        }))
+    }
+
+    pub fn settle(
+        &self,
+        reservation: &Reservation,
+        success: bool,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> Result<(), AccountError> {
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute("UPDATE credit_transactions SET status = 'processing' WHERE id = ?1 AND status = 'pending'", [&reservation.id])?;
+        if changed == 0 {
+            return Ok(());
+        }
+        let billing: BillingConfig = transaction.query_row(
+            "SELECT input_rate, output_rate FROM credit_transactions WHERE id = ?1",
+            [&reservation.id],
+            |row| {
+                Ok(BillingConfig {
+                    input_per_million: row.get(0)?,
+                    output_per_million: row.get(1)?,
+                })
+            },
+        )?;
+        let actual = if success {
+            billing
+                .cost_micro(input_tokens, output_tokens)
+                .min(reservation.amount_micro)
+        } else {
+            0
+        };
+        let refund = reservation.amount_micro - actual;
+        if refund > 0 {
+            transaction.execute(
+                "UPDATE users SET balance_micro = balance_micro + ?1 WHERE id = ?2",
+                params![refund, reservation.user_id],
+            )?;
+        }
+        let balance = transaction.query_row(
+            "SELECT balance_micro FROM users WHERE id = ?1",
+            [reservation.user_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5 WHERE id = ?6",
+            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id],
+        )?;
+        insert_transaction(
+            &transaction,
+            reservation.user_id,
+            None,
+            if success { "refund" } else { "release" },
+            refund,
+            balance,
+            "settled",
+            Some(if success {
+                "预授权未使用部分返还"
+            } else {
+                "请求失败，预授权全额返还"
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn refund(&self, reservation: &Reservation) {
+        if let Err(error) = self.settle(reservation, false, 0, 0) {
+            tracing::error!(reservation = %reservation.id, "释放预授权积分失败: {}", error);
+        }
+    }
+}
+
+fn get_user(connection: &Connection, id: i64) -> Result<AuthUser, AccountError> {
+    connection
+        .query_row(
+            "SELECT id, username, role, balance_micro, enabled FROM users WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(AuthUser {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
+                    balance_micro: row.get(3)?,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(AccountError::NotFound)
+}
+
+fn user_view_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserView> {
+    Ok(UserView {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
+        balance_micro: row.get(3)?,
+        enabled: row.get::<_, i64>(4)? != 0,
+        key_prefix: row.get(5)?,
+        created_at: row.get(6)?,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_spent_micro: 0,
+    })
+}
+
+fn add_usage(connection: &Connection, user: &mut UserView) -> Result<(), AccountError> {
+    let (input, output, spent): (i64, i64, i64) = connection.query_row(
+        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(-amount_micro), 0) FROM credit_transactions WHERE user_id = ?1 AND kind = 'charge' AND status = 'settled'",
+        [user.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    user.total_input_tokens = input;
+    user.total_output_tokens = output;
+    user.total_spent_micro = spent;
+    Ok(())
+}
+
+fn transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransactionView> {
+    Ok(TransactionView {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        username: row.get(2)?,
+        kind: row.get(3)?,
+        amount_micro: row.get(4)?,
+        balance_after_micro: row.get(5)?,
+        model: row.get(6)?,
+        input_tokens: row.get(7)?,
+        output_tokens: row.get(8)?,
+        reserved_micro: row.get(9)?,
+        status: row.get(10)?,
+        note: row.get(11)?,
+        created_at: row.get(12)?,
+        completed_at: row.get(13)?,
+    })
+}
+
+fn insert_transaction(
+    connection: &Connection,
+    user_id: i64,
+    actor_id: Option<i64>,
+    kind: &str,
+    amount: i64,
+    balance: i64,
+    status: &str,
+    note: Option<&str>,
+) -> Result<(), AccountError> {
+    connection.execute(
+        "INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![Uuid::new_v4().to_string(), user_id, actor_id, kind, amount, balance, status, note, now(), now()],
+    )?;
+    Ok(())
+}
+
+fn credits_to_micro(credits: f64) -> Result<i64, AccountError> {
+    if !credits.is_finite() || credits.abs() > 1e12 {
+        return Err(AccountError::InvalidInput("积分数量无效或超出限额".into()));
+    }
+    let micro = (credits * MICRO_CREDITS as f64).round();
+    if micro > i64::MAX as f64 || micro < i64::MIN as f64 {
+        return Err(AccountError::InvalidInput("积分数量超出限额".into()));
+    }
+    Ok(micro as i64)
+}
+
+pub fn key_hash(key: &str) -> String {
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+fn key_prefix(key: &str) -> String {
+    key.chars().take(12).collect()
+}
+
+fn generate_api_key() -> String {
+    format!("sk-usr-{}", Uuid::new_v4().simple())
+}
+
+fn hash_password(password: &str) -> Result<String, AccountError> {
+    Argon2::default()
+        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .map(|hash| hash.to_string())
+        .map_err(|error| AccountError::Internal(format!("密码加密失败: {error}")))
+}
+
+fn verify_password(password: &str, hash: &str) -> Result<bool, AccountError> {
+    let parsed = PasswordHash::new(hash)
+        .map_err(|error| AccountError::Internal(format!("密码哈希损坏: {error}")))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
+fn validate_password(password: &str) -> Result<(), AccountError> {
+    if password.len() < 10 || password.len() > 256 {
+        return Err(AccountError::InvalidInput("密码需为 10-256 个字符".into()));
+    }
+    Ok(())
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> AccountStore {
+        AccountStore::open(":memory:").unwrap()
+    }
+
+    fn manager(store: &AccountStore) -> AuthUser {
+        store.ensure_super_admin("test-admin-key-123456").unwrap();
+        store
+            .authenticate_key("test-admin-key-123456")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn billing_is_precise_and_nonzero() {
+        let config = BillingConfig::default();
+        assert_eq!(config.cost_micro(1, 1), 60);
+        assert_eq!(config.cost_micro(1_000_000, 1_000_000), 60_000_000);
+        assert_eq!(config.cost_micro(0, 0), 1);
+    }
+
+    #[test]
+    fn reserve_and_settle_are_transactional_and_idempotent() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 10.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        assert_eq!(reservation.amount_micro, 60_000);
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            9_940_000
+        );
+        store.settle(&reservation, true, 100, 100).unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            9_994_000
+        );
+        store.settle(&reservation, true, 1000, 1000).unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            9_994_000
+        );
+        let transactions = store.list_transactions(&user, None, 100).unwrap();
+        assert_eq!(transactions.len(), 3);
+        assert_eq!(
+            transactions.iter().filter(|t| t.kind == "charge").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_request_releases_entire_reservation() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 1.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 100, 100).unwrap().unwrap();
+        store.refund(&reservation);
+        store.refund(&reservation);
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            MICRO_CREDITS
+        );
+        assert!(
+            store
+                .list_transactions(&user, None, 100)
+                .unwrap()
+                .iter()
+                .all(|t| t.status == "settled")
+        );
+    }
+
+    #[test]
+    fn insufficient_balance_does_not_create_reservation() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 0.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        assert!(matches!(
+            store.reserve(&user, "sonnet", 100, 100),
+            Err(AccountError::InsufficientCredits { .. })
+        ));
+        assert_eq!(store.list_transactions(&user, None, 100).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn role_and_credit_permissions_are_enforced() {
+        let store = store();
+        let super_admin = manager(&store);
+        let (_, admin_key) = store
+            .create_user(&super_admin, "manager", "password-123", Role::Admin, 0.0)
+            .unwrap();
+        let admin = store.authenticate_key(&admin_key).unwrap().unwrap();
+        assert!(
+            store
+                .create_user(&admin, "other-admin", "password-123", Role::Admin, 0.0)
+                .is_err()
+        );
+        assert!(store.adjust_credits(&admin, admin.id, 100.0, None).is_err());
+        assert!(
+            store
+                .update_user(&super_admin, super_admin.id, Some(false), None)
+                .is_err()
+        );
+        let (_, user_key) = store
+            .create_user(&admin, "alice", "password-123", Role::User, 5.0)
+            .unwrap();
+        let user = store.authenticate_key(&user_key).unwrap().unwrap();
+        assert_eq!(user.balance_micro, 5_000_000);
+        assert!(store.list_users(&user).is_err());
+    }
+
+    #[test]
+    fn password_login_and_key_rotation_invalidate_old_key() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 1.0)
+            .unwrap();
+        let user = store
+            .authenticate_password("alice", "password-123")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .authenticate_password("alice", "incorrect")
+                .unwrap()
+                .is_none()
+        );
+        let new_key = store
+            .change_password(&user, "password-123", "new-password-123")
+            .unwrap();
+        assert!(store.authenticate_key(&key).unwrap().is_none());
+        assert!(store.authenticate_key(&new_key).unwrap().is_some());
+        assert!(
+            store
+                .authenticate_password("alice", "new-password-123")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
