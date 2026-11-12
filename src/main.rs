@@ -177,6 +177,10 @@ async fn main() {
                 .merge(admin_app)
                 .nest("/account", accounts::account_router(account_state.clone())),
         )
+        .route(
+            "/admin/",
+            axum::routing::get(|| async { axum::response::Redirect::permanent("/admin") }),
+        )
         .nest("/admin", admin_ui::create_admin_ui_router());
 
     let addr = format!("{}:{}", config.host, config.port);

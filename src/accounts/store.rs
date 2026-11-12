@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::models::{
-    AccountOverview, AuthUser, BillingConfig, MICRO_CREDITS, Reservation, Role, TransactionView,
-    UserView,
+    AccountOverview, AuthUser, BillingConfig, CreditChangeView, MICRO_CREDITS, RequestLog,
+    Reservation, Role, TransactionView, UserView,
 };
 
 #[derive(Debug)]
@@ -85,7 +85,16 @@ impl AccountStore {
                 status TEXT NOT NULL,
                 note TEXT,
                 created_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                request_id TEXT,
+                path TEXT,
+                stream INTEGER NOT NULL DEFAULT 0,
+                balance_before_micro INTEGER,
+                reserved_balance_micro INTEGER,
+                http_status INTEGER,
+                error_message TEXT,
+                duration_ms INTEGER,
+                first_token_ms INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_transactions_user ON credit_transactions(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_transactions_pending ON credit_transactions(status) WHERE status = 'pending';
@@ -99,6 +108,25 @@ impl AccountStore {
             connection: Mutex::new(connection),
         };
         let connection = store.connection.lock();
+        for (column, definition) in [
+            ("request_id", "TEXT"),
+            ("path", "TEXT"),
+            ("stream", "INTEGER NOT NULL DEFAULT 0"),
+            ("balance_before_micro", "INTEGER"),
+            ("reserved_balance_micro", "INTEGER"),
+            ("http_status", "INTEGER"),
+            ("error_message", "TEXT"),
+            ("duration_ms", "INTEGER"),
+            ("first_token_ms", "INTEGER"),
+        ] {
+            ensure_column(&connection, "credit_transactions", column, definition)?;
+        }
+        connection.execute_batch(
+            "UPDATE credit_transactions SET reserved_micro = -reserved_micro WHERE reserved_micro < 0;
+             UPDATE credit_transactions SET error_message = '历史失败记录：旧版日志未保存具体错误信息' WHERE kind = 'charge' AND status = 'settled' AND amount_micro = 0 AND error_message IS NULL;
+             CREATE INDEX IF NOT EXISTS idx_transactions_created ON credit_transactions(created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_transactions_request ON credit_transactions(request_id, created_at ASC);",
+        )?;
         connection.execute(
             "INSERT OR IGNORE INTO billing_config VALUES (1, 10.0, 50.0)",
             [],
@@ -323,6 +351,7 @@ impl AccountStore {
                 amount,
                 "settled",
                 Some("开户初始积分"),
+                None,
             )?;
         }
         transaction.commit()?;
@@ -449,6 +478,7 @@ impl AccountStore {
             balance,
             "settled",
             note,
+            None,
         )?;
         transaction.commit()?;
         drop(connection);
@@ -519,12 +549,16 @@ impl AccountStore {
         };
         let connection = self.connection.lock();
         let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model,
-                   t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at
-                   FROM credit_transactions t JOIN users u ON u.id = t.user_id ";
+                   t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at,
+                   t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro,
+                   COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms
+                   FROM credit_transactions t JOIN users u ON u.id = t.user_id
+                   LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release')
+                   WHERE t.kind IN ('reserve', 'charge', 'error') ";
         let order = " ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?1";
         let mut rows = Vec::new();
         if let Some(user_id) = user_id {
-            let mut statement = connection.prepare(&format!("{sql}WHERE t.user_id = ?2{order}"))?;
+            let mut statement = connection.prepare(&format!("{sql}AND t.user_id = ?2{order}"))?;
             let results =
                 statement.query_map(params![limit.min(500) as i64, user_id], transaction_row)?;
             for row in results {
@@ -581,10 +615,11 @@ impl AccountStore {
             [user.id],
             |row| row.get(0),
         )?;
+        let balance_before = balance + amount;
         transaction.execute(
-            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at)
-             VALUES (?1, ?2, 'reserve', ?3, ?4, ?5, ?6, ?7, ?3, ?9, ?10, 'pending', ?8)",
-            params![id, user.id, -amount, balance, model, estimated_input, output_limit, now(), billing.input_per_million, billing.output_per_million],
+            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at, request_id, balance_before_micro, reserved_balance_micro)
+             VALUES (?1, ?2, 'reserve', ?3, ?4, ?5, ?6, ?7, ?12, ?9, ?10, 'pending', ?8, ?1, ?11, ?4)",
+            params![id, user.id, -amount, balance, model, estimated_input, output_limit, now(), billing.input_per_million, billing.output_per_million, balance_before, amount],
         )?;
         transaction.commit()?;
         Ok(Some(Reservation {
@@ -601,6 +636,7 @@ impl AccountStore {
         success: bool,
         input_tokens: i64,
         output_tokens: i64,
+        log: Option<&RequestLog>,
     ) -> Result<(), AccountError> {
         let connection = self.connection.lock();
         let transaction = connection.unchecked_transaction()?;
@@ -637,9 +673,16 @@ impl AccountStore {
             [reservation.user_id],
             |row| row.get(0),
         )?;
+        let reserved_balance_micro: Option<i64> = transaction.query_row(
+            "SELECT reserved_balance_micro FROM credit_transactions WHERE id = ?1",
+            [&reservation.id],
+            |row| row.get(0),
+        )?;
+        let balance_before_micro = reserved_balance_micro
+            .map(|balance_after_reservation| balance_after_reservation + reservation.amount_micro);
         transaction.execute(
-            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5 WHERE id = ?6",
-            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id],
+            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15 WHERE id = ?16",
+            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), reservation.id],
         )?;
         insert_transaction(
             &transaction,
@@ -654,15 +697,69 @@ impl AccountStore {
             } else {
                 "请求失败，预授权全额返还"
             }),
+            Some(&reservation.id),
         )?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn refund(&self, reservation: &Reservation) {
-        if let Err(error) = self.settle(reservation, false, 0, 0) {
+    pub fn refund(&self, reservation: &Reservation, log: Option<&RequestLog>) {
+        if let Err(error) = self.settle(reservation, false, 0, 0, log) {
             tracing::error!(reservation = %reservation.id, "释放预授权积分失败: {}", error);
         }
+    }
+
+    pub fn record_rejected_request(
+        &self,
+        user: &AuthUser,
+        path: &str,
+        model: &str,
+        stream: bool,
+        http_status: u16,
+        error_message: &str,
+        duration_ms: i64,
+    ) {
+        let result = self.connection.lock().execute(
+            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, reserved_micro, status, created_at, completed_at, request_id, path, stream, http_status, error_message, duration_ms)
+             VALUES (?1, ?2, 'error', 0, ?3, ?4, 0, 'settled', ?5, ?5, ?1, ?6, ?7, ?8, ?9, ?10)",
+            params![format!("req_{}", Uuid::new_v4().simple()), user.id, user.balance_micro, model, now(), path, stream as i64, http_status, error_message, duration_ms],
+        );
+        if let Err(error) = result {
+            tracing::error!("记录请求错误日志失败: {}", error);
+        }
+    }
+
+    pub fn list_credit_changes(
+        &self,
+        actor: &AuthUser,
+        requested_user: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<CreditChangeView>, AccountError> {
+        let user_id = if actor.is_manager() {
+            requested_user
+        } else {
+            Some(actor.id)
+        };
+        let connection = self.connection.lock();
+        let sql = "SELECT kind, amount_micro, balance_after_micro, note, created_at, completed_at
+                   FROM credit_transactions WHERE request_id IS NULL AND kind IN ('initial', 'adjustment')";
+        let order = " ORDER BY created_at DESC, rowid DESC LIMIT ?1";
+        let mut changes = Vec::new();
+        if let Some(user_id) = user_id {
+            let mut statement = connection.prepare(&format!("{sql} AND user_id = ?2{order}"))?;
+            let rows =
+                statement.query_map(params![limit.min(500) as i64, user_id], credit_change_row)?;
+            for row in rows {
+                changes.push(row?);
+            }
+        } else {
+            let mut statement = connection.prepare(&format!("{sql}{order}"))?;
+            let rows = statement.query_map([limit.min(500) as i64], credit_change_row)?;
+            for row in rows {
+                changes.push(row?);
+            }
+        }
+        Ok(changes)
     }
 }
 
@@ -727,7 +824,59 @@ fn transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransactionView>
         note: row.get(11)?,
         created_at: row.get(12)?,
         completed_at: row.get(13)?,
+        request_id: row.get(14)?,
+        path: row.get(15)?,
+        stream: row.get::<_, i64>(16)? != 0,
+        balance_before_micro: row.get(17)?,
+        reserved_balance_micro: row.get(18)?,
+        refund_micro: row.get(19)?,
+        http_status: row.get(20)?,
+        error_message: row.get(21)?,
+        duration_ms: row.get(22)?,
+        first_token_ms: row.get(23)?,
     })
+}
+
+impl TransactionView {
+    #[cfg(test)]
+    fn is_legacy_failure(&self) -> bool {
+        self.request_id.is_none()
+            && self.reserved_micro > 0
+            && self.amount_micro == 0
+            && self.status == "settled"
+    }
+}
+
+fn credit_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CreditChangeView> {
+    Ok(CreditChangeView {
+        kind: row.get(0)?,
+        amount_micro: row.get(1)?,
+        balance_after_micro: row.get(2)?,
+        note: row.get(3)?,
+        created_at: row.get(4)?,
+        completed_at: row.get(5)?,
+    })
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), AccountError> {
+    let exists = {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .contains(&column.to_string())
+    };
+    if !exists {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_transaction(
@@ -739,10 +888,11 @@ fn insert_transaction(
     balance: i64,
     status: &str,
     note: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<(), AccountError> {
     connection.execute(
-        "INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![Uuid::new_v4().to_string(), user_id, actor_id, kind, amount, balance, status, note, now(), now()],
+        "INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at, request_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![Uuid::new_v4().to_string(), user_id, actor_id, kind, amount, balance, status, note, now(), now(), request_id],
     )?;
     Ok(())
 }
@@ -834,22 +984,24 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_940_000
         );
-        store.settle(&reservation, true, 100, 100).unwrap();
+        store.settle(&reservation, true, 100, 100, None).unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
         );
-        store.settle(&reservation, true, 1000, 1000).unwrap();
+        store.settle(&reservation, true, 1000, 1000, None).unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
         );
         let transactions = store.list_transactions(&user, None, 100).unwrap();
-        assert_eq!(transactions.len(), 3);
-        assert_eq!(
-            transactions.iter().filter(|t| t.kind == "charge").count(),
-            1
-        );
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].kind, "charge");
+        assert_eq!(transactions[0].amount_micro, -6_000);
+        assert_eq!(transactions[0].balance_before_micro, Some(10_000_000));
+        assert_eq!(transactions[0].reserved_balance_micro, Some(9_940_000));
+        assert_eq!(transactions[0].refund_micro, 54_000);
+        assert_eq!(transactions[0].balance_after_micro, 9_994_000);
     }
 
     #[test]
@@ -861,19 +1013,17 @@ mod tests {
             .unwrap();
         let user = store.authenticate_key(&key).unwrap().unwrap();
         let reservation = store.reserve(&user, "sonnet", 100, 100).unwrap().unwrap();
-        store.refund(&reservation);
-        store.refund(&reservation);
+        store.refund(&reservation, None);
+        store.refund(&reservation, None);
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             MICRO_CREDITS
         );
-        assert!(
-            store
-                .list_transactions(&user, None, 100)
-                .unwrap()
-                .iter()
-                .all(|t| t.status == "settled")
-        );
+        let transactions = store.list_transactions(&user, None, 100).unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert!(transactions[0].is_legacy_failure() || transactions[0].refund_micro == 6_000);
+        assert_eq!(transactions[0].amount_micro, 0);
+        assert_eq!(transactions[0].balance_after_micro, MICRO_CREDITS);
     }
 
     #[test]

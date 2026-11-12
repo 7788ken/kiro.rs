@@ -4,57 +4,82 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --background: 220 20% 98%;
+    --foreground: 224 32% 16%;
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 224 32% 16%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
-    --radius: 0.5rem;
+    --popover-foreground: 224 32% 16%;
+    --primary: 234 67% 56%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 16% 94%;
+    --secondary-foreground: 224 26% 27%;
+    --muted: 220 16% 94%;
+    --muted-foreground: 220 10% 46%;
+    --accent: 220 18% 95%;
+    --accent-foreground: 224 32% 20%;
+    --destructive: 0 67% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 153 55% 32%;
+    --warning: 34 82% 35%;
+    --border: 220 17% 89%;
+    --input: 220 17% 85%;
+    --ring: 234 67% 56%;
+    --radius: 0.625rem;
+    --sidebar: 220 25% 99%;
+    --sidebar-border: 220 17% 91%;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
+    --background: 224 28% 9%;
+    --foreground: 220 18% 93%;
+    --card: 224 25% 12%;
+    --card-foreground: 220 18% 93%;
+    --popover: 224 25% 12%;
+    --popover-foreground: 220 18% 93%;
+    --primary: 234 82% 73%;
+    --primary-foreground: 234 50% 14%;
+    --secondary: 222 18% 19%;
+    --secondary-foreground: 220 18% 93%;
+    --muted: 222 18% 19%;
+    --muted-foreground: 220 12% 65%;
+    --accent: 222 20% 18%;
+    --accent-foreground: 220 18% 96%;
+    --destructive: 0 65% 64%;
+    --destructive-foreground: 0 65% 12%;
+    --success: 153 52% 58%;
+    --warning: 37 85% 65%;
+    --border: 222 18% 23%;
+    --input: 222 18% 29%;
+    --ring: 234 82% 73%;
+    --sidebar: 224 28% 10%;
+    --sidebar-border: 222 18% 19%;
   }
+
+  * { @apply border-border; }
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    @apply m-0 bg-background text-foreground antialiased;
+    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  button, input, select, textarea { font: inherit; }
+  button, a, [role="button"], [role="switch"], [role="checkbox"] { -webkit-tap-highlight-color: transparent; }
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
+  ::selection { @apply bg-primary/15 text-foreground; }
 }
 
-@layer base {
-  * {
-    @apply border-border;
-  }
-  body {
-    @apply bg-background text-foreground;
-    font-feature-settings: "rlig" 1, "calt" 1;
+@layer utilities {
+  .text-success { color: hsl(var(--success)); }
+  .text-warning { color: hsl(var(--warning)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

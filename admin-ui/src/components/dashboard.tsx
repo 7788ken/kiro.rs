@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, UsersRound } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { storage } from '@/lib/storage'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
@@ -16,13 +15,13 @@ import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingM
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
+import { EmptyState, MetricCard, PageSection } from '@/components/page-elements'
 
 interface DashboardProps {
   onLogout: () => void
-  onOpenAccounts: () => void
 }
 
-export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
+export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -42,13 +41,6 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return document.documentElement.classList.contains('dark')
-    }
-    return false
-  })
-
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
@@ -106,11 +98,6 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
     })
   }, [data?.credentials])
 
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode)
-    document.documentElement.classList.toggle('dark')
-  }
-
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
@@ -122,7 +109,6 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
   }
 
   const handleLogout = () => {
-    storage.removeApiKey()
     queryClient.clear()
     onLogout()
   }
@@ -510,7 +496,7 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="flex min-h-[50vh] items-center justify-center">
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
           <p className="text-muted-foreground">加载中...</p>
@@ -521,7 +507,7 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
 
   if (error) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background p-4">
+      <div className="flex min-h-[50vh] items-center justify-center">
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <div className="text-red-500 mb-4">加载失败</div>
@@ -536,253 +522,49 @@ export function Dashboard({ onLogout, onOpenAccounts }: DashboardProps) {
     )
   }
 
+  const loadBalancingMode = loadBalancingData?.mode || 'priority'
+
   return (
-    <div className="min-h-screen bg-background">
-      {/* 顶部导航 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2">
-            <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
+    <div className="space-y-7">
+      <div className="grid gap-4 sm:grid-cols-3">
+        <MetricCard label="凭据总数" value={data?.total || 0} detail={`${disabledCredentialCount} 个已禁用`} icon={Server} />
+        <MetricCard label="可用凭据" value={data?.available || 0} detail="可参与上游请求分配" icon={CheckCircle2} tone="success" />
+        <MetricCard label="当前活跃" value={`#${data?.currentId || '-'}`} detail={loadBalancingMode === 'priority' ? '按优先级顺序使用' : '在可用凭据间均衡分配'} icon={RotateCcw} tone="accent" />
+      </div>
+
+      <PageSection title="连接池" description="点击卡片中的优先级可直接编辑，禁用后才能删除凭据。" actions={<><Button variant="outline" size="sm" onClick={handleToggleLoadBalancing} disabled={isLoadingMode || isSettingMode}><RotateCcw />{loadBalancingMode === 'priority' ? '优先级模式' : '均衡负载'}</Button><Button variant="ghost" size="icon" title="刷新凭据列表" aria-label="刷新凭据列表" onClick={handleRefresh}><RefreshCw /></Button></>}>
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setKamImportDialogOpen(true)}><FileUp />KAM 导入</Button>
+            <Button variant="outline" size="sm" onClick={() => setBatchImportDialogOpen(true)}><Upload />批量导入</Button>
+            <Button size="sm" onClick={() => setAddDialogOpen(true)}><Plus />添加凭据</Button>
           </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={onOpenAccounts}><UsersRound />用户与积分</Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
-              {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
-              <RefreshCw className="h-5 w-5" />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
-              <LogOut className="h-5 w-5" />
-            </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            {data?.credentials && data.credentials.length > 0 && <Button onClick={handleQueryCurrentPageInfo} size="sm" variant="outline" disabled={queryingInfo}><RefreshCw className={queryingInfo ? 'animate-spin' : ''} />{queryingInfo ? `查询 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页信息'}</Button>}
+            {data?.credentials && data.credentials.length > 0 && <Button onClick={handleClearAll} size="sm" variant="ghost" className="text-destructive hover:text-destructive" disabled={disabledCredentialCount === 0} title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}><Trash2 />清除已禁用</Button>}
           </div>
         </div>
-      </header>
 
-      {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        {selectedIds.size > 0 && <div className="flex flex-col gap-3 rounded-xl border border-primary/15 bg-primary/[0.04] p-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-3 px-1"><Badge>已选择 {selectedIds.size} 个</Badge><button className="min-h-10 text-xs text-muted-foreground hover:text-foreground" onClick={deselectAll}>取消选择</button></div><div className="flex flex-wrap gap-2"><Button onClick={handleBatchVerify} size="sm" variant="outline"><CheckCircle2 />批量验活</Button><Button onClick={handleBatchForceRefresh} size="sm" variant="outline" disabled={batchRefreshing}><RefreshCw className={batchRefreshing ? 'animate-spin' : ''} />{batchRefreshing ? `刷新 ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新'}</Button><Button onClick={handleBatchResetFailure} size="sm" variant="outline"><RotateCcw />恢复异常</Button><Button onClick={handleBatchDelete} size="sm" variant="destructive" disabled={selectedDisabledCount === 0} title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}><Trash2 />删除</Button></div></div>}
+        {verifying && !verifyDialogOpen && <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary"><CheckCircle2 className="animate-spin" />验活中 {verifyProgress.current}/{verifyProgress.total}</Button>}
 
-        {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
-                  <Button onClick={deselectAll} size="sm" variant="ghost">
-                    取消选择
-                  </Button>
-                </div>
-              )}
+        {data?.credentials.length === 0 ? (
+          <Card><CardContent className="p-0"><EmptyState icon={Server} title="还没有上游凭据" description="添加 Kiro OAuth 或 API Key 凭据，建立可供用户请求使用的连接池。" action={<Button onClick={() => setAddDialogOpen(true)}><Plus />添加第一个凭据</Button>} /></CardContent></Card>
+        ) : (
+          <>
+            <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+              {currentCredentials.map(credential => <CredentialCard key={credential.id} credential={credential} onViewBalance={handleViewBalance} selected={selectedIds.has(credential.id)} onToggleSelect={() => toggleSelect(credential.id)} balance={balanceMap.get(credential.id) || null} loadingBalance={loadingBalanceIds.has(credential.id)} />)}
             </div>
-            <div className="flex gap-2">
-              {selectedIds.size > 0 && (
-                <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
-                  </Button>
-                  <Button
-                    onClick={handleBatchForceRefresh}
-                    size="sm"
-                    variant="outline"
-                    disabled={batchRefreshing}
-                  >
-                    <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
-                    {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
-                  </Button>
-                  <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
-                    <RotateCcw className="h-4 w-4 mr-2" />
-                    恢复异常
-                  </Button>
-                  <Button
-                    onClick={handleBatchDelete}
-                    size="sm"
-                    variant="destructive"
-                    disabled={selectedDisabledCount === 0}
-                    title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
-                  >
-                    <Trash2 className="h-4 w-4 mr-2" />
-                    批量删除
-                  </Button>
-                </>
-              )}
-              {verifying && !verifyDialogOpen && (
-                <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
-                  <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
-                  验活中... {verifyProgress.current}/{verifyProgress.total}
-                </Button>
-              )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleQueryCurrentPageInfo}
-                  size="sm"
-                  variant="outline"
-                  disabled={queryingInfo}
-                >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
-                </Button>
-              )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleClearAll}
-                  size="sm"
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
-                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
-                >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
-                </Button>
-              )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm">
-                <Plus className="h-4 w-4 mr-2" />
-                添加凭据
-              </Button>
-            </div>
-          </div>
-          {data?.credentials.length === 0 ? (
-            <Card>
-              <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
-              </CardContent>
-            </Card>
-          ) : (
-            <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {currentCredentials.map((credential) => (
-                  <CredentialCard
-                    key={credential.id}
-                    credential={credential}
-                    onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
-                    balance={balanceMap.get(credential.id) || null}
-                    loadingBalance={loadingBalanceIds.has(credential.id)}
-                  />
-                ))}
-              </div>
+            {totalPages > 1 && <div className="flex flex-wrap items-center justify-center gap-3 pt-2"><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}>上一页</Button><span className="text-sm text-muted-foreground tabular-nums">第 {currentPage} / {totalPages} 页 · 共 {data?.credentials.length} 个</span><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>下一页</Button></div>}
+          </>
+        )}
+      </PageSection>
 
-              {/* 分页控件 */}
-              {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
-                  >
-                    上一页
-                  </Button>
-                  <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
-                  >
-                    下一页
-                  </Button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      </main>
-
-      {/* 余额对话框 */}
-      <BalanceDialog
-        credentialId={selectedCredentialId}
-        open={balanceDialogOpen}
-        onOpenChange={setBalanceDialogOpen}
-      />
-
-      {/* 添加凭据对话框 */}
-      <AddCredentialDialog
-        open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
-      />
-
-      {/* 批量导入对话框 */}
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
-      />
-
-      {/* KAM 账号导入对话框 */}
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
-      />
-
-      {/* 批量验活对话框 */}
-      <BatchVerifyDialog
-        open={verifyDialogOpen}
-        onOpenChange={setVerifyDialogOpen}
-        verifying={verifying}
-        progress={verifyProgress}
-        results={verifyResults}
-        onCancel={handleCancelVerify}
-      />
+      <BalanceDialog credentialId={selectedCredentialId} open={balanceDialogOpen} onOpenChange={setBalanceDialogOpen} />
+      <AddCredentialDialog open={addDialogOpen} onOpenChange={setAddDialogOpen} />
+      <BatchImportDialog open={batchImportDialogOpen} onOpenChange={setBatchImportDialogOpen} />
+      <KamImportDialog open={kamImportDialogOpen} onOpenChange={setKamImportDialogOpen} />
+      <BatchVerifyDialog open={verifyDialogOpen} onOpenChange={setVerifyDialogOpen} verifying={verifying} progress={verifyProgress} results={verifyResults} onCancel={handleCancelVerify} />
     </div>
   )
 }

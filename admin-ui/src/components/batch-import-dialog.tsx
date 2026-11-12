@@ -9,6 +9,9 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Progress } from '@/components/ui/progress'
+import { textareaClass } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -418,57 +421,36 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
+            <label htmlFor="batch-json" className="text-sm font-medium">JSON 格式凭据</label>
             <textarea
+              id="batch-json"
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              className={textareaClass}
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              导入时自动验活，失败的凭据会被排除
             </p>
           </div>
 
           {(importing || results.length > 0) && (
             <>
               {/* 进度条 */}
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span>{importing ? '验活进度' : '验活完成'}</span>
-                  <span>{progress.current} / {progress.total}</span>
+              <div className="space-y-3">
+                <div className="flex justify-between text-sm"><span>{importing ? '处理进度' : '处理完成'}</span><span className="tabular-nums">{progress.current} / {progress.total}</span></div>
+                <Progress value={progress.current} max={progress.total} />
+                {importing && currentProcessing && <p className="text-xs text-muted-foreground">{currentProcessing}</p>}
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="success">成功 {results.filter(r => r.status === 'verified').length}</Badge>
+                  <Badge variant="warning">重复 {results.filter(r => r.status === 'duplicate').length}</Badge>
+                  <Badge variant={results.some(r => r.status === 'failed') ? 'destructive' : 'secondary'}>失败 {results.filter(r => r.status === 'failed').length}</Badge>
                 </div>
-                <div className="w-full bg-secondary rounded-full h-2">
-                  <div
-                    className="bg-primary h-2 rounded-full transition-all"
-                    style={{ width: `${(progress.current / progress.total) * 100}%` }}
-                  />
-                </div>
-                {importing && currentProcessing && (
-                  <div className="text-xs text-muted-foreground">
-                    {currentProcessing}
-                  </div>
-                )}
-              </div>
-
-              {/* 统计 */}
-              <div className="flex gap-4 text-sm">
-                <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
-                </span>
-                <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
-                </span>
-                <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
-                </span>
               </div>
 
               {/* 结果列表 */}
-              <div className="border rounded-md divide-y max-h-[300px] overflow-y-auto">
+              <div className="max-h-[300px] divide-y overflow-y-auto rounded-lg border bg-muted/20">
                 {results.map((result) => (
                   <div key={result.index} className="p-3">
                     <div className="flex items-start gap-3">

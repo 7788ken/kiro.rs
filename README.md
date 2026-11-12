@@ -19,7 +19,7 @@
 
 本分支在原有 Kiro 凭据池之上增加独立的用户体系与积分账本，不需要 MySQL 或 Redis。用户、密码哈希、API Key 哈希、网页会话和积分流水保存在配置文件同目录的 `accounts.db`（SQLite），部署时请持久化并定期备份该文件。
 
-**部署、HTTPS、升级、备份与回滚详见 [部署手册](docs/DEPLOYMENT.md)。**
+**部署、HTTPS、升级、备份与回滚详见 [部署手册](docs/DEPLOYMENT.md)。后台视觉、组件与交互规范详见 [后台 UI / UX 设计手册](docs/ADMIN_UI_UX_GUIDE.md)。**
 
 ### 角色与登录
 
@@ -30,6 +30,8 @@
 | 用户 | 使用独立 API Key 调用 API、查看自己的余额和流水、修改密码与轮换 Key |
 
 原 `adminApiKey` 自动初始化名为 `superadmin` 的超管账户，初始密码与该密钥相同。首次使用后建议在「安全与设置」中修改密码。也可以直接使用原管理员密钥登录。
+
+后台模块均有独立 URL，支持直接访问、刷新、分享及浏览器前进后退：`/admin/credentials`（上游凭据）、`/admin/users`（用户与额度）、`/admin/overview`（我的账户）、`/admin/transactions`（积分流水）、`/admin/settings`（安全与设置）。未登录访问子路径会在登录后返回原页面，无权限路径回退到我的账户。
 
 密码登录使用 12 小时网页会话，**不会轮换正在使用的 API Key**。API Key 只在创建、主动重置或修改密码时完整展示一次，数据库不保存明文 Key。密码登录入口为 `POST /api/account/login`，退出为 `POST /api/account/logout`。
 
@@ -42,13 +44,16 @@
 - 预授权保存单价快照，修改单价不会影响正在执行的请求。
 - 余额不足返回 `402`，不会调用上游；管理角色不扣用户积分。
 - token 统计依赖代理返回的 usage；输入和输出统计口径与原有代理一致。
+- 「积分流水 → 调用日志」每次调用只显示一行：成功显示实际消费，失败显示 `0` 和错误状态；详情包含错误摘要、总耗时、首字时间、输入/输出 Token、预扣、返还及结算后余额。「充值调整」单独保留开户积分和管理员调整记录。
+- 调用日志复用积分账本事务，只记录少量元数据，不保存提示词、完整回复或逐分片内容；错误摘要最多 2 KB，查询最多返回 500 条。历史日志未保存的错误、耗时和完整预扣关联无法补回。
 
 充值和扣减通过「用户管理 → 调整积分」完成：正数充值，负数扣减，所有变动均有流水。禁止管理员给自己调积分，超管不能通过普通管理接口删除自己或修改为低权限角色。
 
 ### 账户 API
 
 - `GET /api/account/me`：个人账户、余额与用量概览。
-- `GET /api/account/transactions?userId=&limit=`：流水；普通用户始终只能查询本人。
+- `GET /api/account/transactions?userId=&limit=`：聚合调用日志（最多 500 条）；普通用户始终只能查询本人。
+- `GET /api/account/transactions/adjustments?userId=&limit=`：开户积分与管理员调整记录。
 - `POST /api/account/password`：修改密码并轮换 API Key。
 - `POST /api/account/key`：轮换自己的 API Key。
 - `GET|POST /api/admin/users`：用户列表与创建用户。

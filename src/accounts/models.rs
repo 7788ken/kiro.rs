@@ -121,6 +121,38 @@ pub struct TransactionView {
     pub note: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    pub request_id: Option<String>,
+    pub path: Option<String>,
+    pub stream: bool,
+    pub balance_before_micro: Option<i64>,
+    pub reserved_balance_micro: Option<i64>,
+    pub refund_micro: i64,
+    pub http_status: Option<u16>,
+    pub error_message: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub first_token_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditChangeView {
+    pub kind: String,
+    pub amount_micro: i64,
+    pub balance_after_micro: i64,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLog {
+    pub path: String,
+    pub model: String,
+    pub stream: bool,
+    pub http_status: u16,
+    pub error_message: Option<String>,
+    pub duration_ms: i64,
+    pub first_token_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -41,6 +41,10 @@ export default {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
         },
+        success: 'hsl(var(--success))',
+        warning: 'hsl(var(--warning))',
+        sidebar: 'hsl(var(--sidebar))',
+        'sidebar-border': 'hsl(var(--sidebar-border))',
       },
       borderRadius: {
         lg: 'var(--radius)',

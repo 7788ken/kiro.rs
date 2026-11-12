@@ -34,7 +34,7 @@ export interface CreditTransaction {
   id: string
   userId: number
   username: string
-  kind: 'initial' | 'adjustment' | 'charge' | 'refund' | 'release' | 'reserve'
+  kind: 'reserve' | 'charge' | 'error'
   amountMicro: number
   balanceAfterMicro: number
   model?: string
@@ -42,6 +42,25 @@ export interface CreditTransaction {
   outputTokens: number
   reservedMicro: number
   status: 'pending' | 'settled' | 'processing'
+  note?: string
+  createdAt: string
+  completedAt?: string
+  requestId?: string
+  path?: string
+  stream: boolean
+  balanceBeforeMicro?: number
+  reservedBalanceMicro?: number
+  refundMicro: number
+  httpStatus?: number
+  errorMessage?: string
+  durationMs?: number
+  firstTokenMs?: number
+}
+
+export interface CreditChange {
+  kind: 'initial' | 'adjustment'
+  amountMicro: number
+  balanceAfterMicro: number
   note?: string
   createdAt: string
   completedAt?: string

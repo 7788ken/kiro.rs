@@ -24,6 +24,7 @@ pub fn account_router(state: AccountState) -> Router {
         .route("/password", post(change_password))
         .route("/key", post(regenerate_own_key))
         .route("/transactions", get(get_transactions))
+        .route("/transactions/adjustments", get(get_credit_changes))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             account_auth_middleware,
@@ -134,6 +135,18 @@ async fn get_transactions(
         state
             .store
             .list_transactions(&user, query.user_id, query.limit.unwrap_or(100)),
+    )
+}
+
+async fn get_credit_changes(
+    State(state): State<AccountState>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<TransactionQuery>,
+) -> Response {
+    respond(
+        state
+            .store
+            .list_credit_changes(&user, query.user_id, query.limit.unwrap_or(100)),
     )
 }
 

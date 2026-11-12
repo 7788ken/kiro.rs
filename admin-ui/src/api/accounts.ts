@@ -1,6 +1,6 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
-import type { AccountOverview, BillingConfig, CreditTransaction, ManagedUser, Role } from '@/types/accounts'
+import type { AccountOverview, BillingConfig, CreditChange, CreditTransaction, ManagedUser, Role } from '@/types/accounts'
 
 const accountApi = axios.create({ baseURL: '/api' })
 accountApi.interceptors.request.use((config) => {
@@ -25,6 +25,11 @@ export async function getAccount(): Promise<AccountOverview> {
 
 export async function getTransactions(userId?: number): Promise<CreditTransaction[]> {
   const { data } = await accountApi.get<CreditTransaction[]>('/account/transactions', { params: { userId, limit: 200 } })
+  return data
+}
+
+export async function getCreditChanges(userId?: number): Promise<CreditChange[]> {
+  const { data } = await accountApi.get<CreditChange[]>('/account/transactions/adjustments', { params: { userId, limit: 200 } })
   return data
 }
 

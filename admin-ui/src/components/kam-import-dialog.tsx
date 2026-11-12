@@ -9,6 +9,10 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
+import { textareaClass } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -414,13 +418,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <label htmlFor="kam-json" className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
+              id="kam-json"
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              className={textareaClass}
             />
           </div>
 
@@ -436,12 +441,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               </div>
               {errorAccountCount > 0 && (
                 <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={skipErrorAccounts}
-                    onChange={(e) => setSkipErrorAccounts(e.target.checked)}
-                    className="rounded border-gray-300"
-                  />
+                  <Checkbox checked={skipErrorAccounts} onCheckedChange={checked => setSkipErrorAccounts(checked === true)} />
                   跳过 error 状态的账号
                 </label>
               )}
@@ -451,38 +451,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           {/* 导入进度和结果 */}
           {(importing || results.length > 0) && (
             <>
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span>{importing ? '导入进度' : '导入完成'}</span>
-                  <span>{progress.current} / {progress.total}</span>
+              <div className="space-y-3">
+                <div className="flex justify-between text-sm"><span>{importing ? '处理进度' : '处理完成'}</span><span className="tabular-nums">{progress.current} / {progress.total}</span></div>
+                <Progress value={progress.current} max={progress.total} />
+                {importing && currentProcessing && <p className="text-xs text-muted-foreground">{currentProcessing}</p>}
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="success">成功 {results.filter(r => r.status === 'verified').length}</Badge>
+                  <Badge variant="warning">重复 {results.filter(r => r.status === 'duplicate').length}</Badge>
+                  <Badge variant={results.some(r => r.status === 'failed') ? 'destructive' : 'secondary'}>失败 {results.filter(r => r.status === 'failed').length}</Badge>
+                  <Badge variant="outline">跳过 {results.filter(r => r.status === 'skipped').length}</Badge>
                 </div>
-                <div className="w-full bg-secondary rounded-full h-2">
-                  <div
-                    className="bg-primary h-2 rounded-full transition-all"
-                    style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }}
-                  />
-                </div>
-                {importing && currentProcessing && (
-                  <div className="text-xs text-muted-foreground">{currentProcessing}</div>
-                )}
               </div>
 
-              <div className="flex gap-4 text-sm">
-                <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
-                </span>
-                <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
-                </span>
-                <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
-                </span>
-                <span className="text-gray-500">
-                  ○ 跳过: {results.filter(r => r.status === 'skipped').length}
-                </span>
-              </div>
-
-              <div className="border rounded-md divide-y max-h-[300px] overflow-y-auto">
+              <div className="max-h-[300px] divide-y overflow-y-auto rounded-lg border bg-muted/20">
                 {results.map((result) => (
                   <div key={result.index} className="p-3">
                     <div className="flex items-start gap-3">

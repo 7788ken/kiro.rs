@@ -4,6 +4,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
 import './index.css'
 
+const savedTheme = localStorage.getItem('kiro-admin-theme')
+document.documentElement.classList.toggle('dark', savedTheme ? savedTheme === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches)
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
