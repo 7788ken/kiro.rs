@@ -103,6 +103,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
+    /// 登记该凭据的管理员账户 ID；旧凭据为空，仅超管可管理
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_by: Option<i64>,
+
+    /// 登记时的管理员名称，仅用于展示
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_by_name: Option<String>,
+
     /// 端点名称（可选）
     ///
     /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
@@ -342,7 +350,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -460,7 +468,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -491,7 +499,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -605,7 +613,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = original.to_pretty_json().unwrap();

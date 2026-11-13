@@ -1,5 +1,6 @@
 //! Anthropic API 中间件
 
+use parking_lot::RwLock;
 use std::sync::Arc;
 
 use axum::{
@@ -22,11 +23,12 @@ pub struct AppState {
     pub api_key: String,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
-    pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub kiro_provider: Option<Arc<RwLock<Arc<KiroProvider>>>>,
     /// 是否开启非流式响应的 thinking 块提取
-    pub extract_thinking: bool,
+    pub extract_thinking: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 账户服务，用于用户鉴权和积分计费
     pub accounts: Option<AccountState>,
+    pub tracker: crate::admin::RequestTracker,
 }
 
 impl AppState {
@@ -35,18 +37,22 @@ impl AppState {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            extract_thinking,
+            extract_thinking: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                extract_thinking,
+            )),
             accounts: None,
+            tracker: crate::admin::RequestTracker::new(),
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
+        self.kiro_provider = Some(Arc::new(RwLock::new(Arc::new(provider))));
         self
     }
 
     pub fn with_accounts(mut self, accounts: AccountState) -> Self {
+        self.tracker = accounts.tracker.clone();
         self.accounts = Some(accounts);
         self
     }
@@ -58,7 +64,7 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Some(accounts) = state.accounts {
+    if let Some(accounts) = state.accounts.clone() {
         let Some(key) = auth::extract_api_key(&request) else {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -67,6 +73,13 @@ pub async fn auth_middleware(
                 .into_response();
         };
         match crate::accounts::middleware::authenticate_api_key(&accounts, &key).await {
+            Ok(user) if user.is_manager() => {
+                let path = request.uri().path().to_string();
+                let live = accounts.tracker.begin(&user, &path, "", false);
+                let response = next.run(request).await;
+                live.finish(response.status().as_u16(), 0, 0, None, None);
+                response
+            }
             Ok(user) => {
                 let mut request = request;
                 request.extensions_mut().insert(user);

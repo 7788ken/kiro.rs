@@ -20,6 +20,13 @@ use super::{
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
+pub static SHARED_APP_STATE: std::sync::OnceLock<std::sync::Arc<parking_lot::RwLock<AppState>>> =
+    std::sync::OnceLock::new();
+
+pub fn shared_app_state() -> &'static std::sync::Arc<parking_lot::RwLock<AppState>> {
+    SHARED_APP_STATE.get().expect("应用状态尚未初始化")
+}
+
 /// 创建带有用户鉴权和积分计费的 Anthropic API 路由
 pub fn create_router_with_accounts(
     kiro_provider: Option<KiroProvider>,
@@ -58,10 +65,12 @@ pub fn create_router_with_accounts(
             auth_middleware,
         ));
 
+    let shared = std::sync::Arc::new(parking_lot::RwLock::new(state));
+    let _ = SHARED_APP_STATE.set(shared.clone());
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(shared.read().clone())
 }

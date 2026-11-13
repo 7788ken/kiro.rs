@@ -8,6 +8,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::{AccountStore, AuthUser, Role};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
@@ -34,6 +35,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    account_store: Arc<AccountStore>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -44,6 +46,7 @@ impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        account_store: Arc<AccountStore>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -53,6 +56,7 @@ impl AdminService {
 
         Self {
             token_manager,
+            account_store,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -60,9 +64,16 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
-    pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+    pub fn get_all_credentials(
+        &self,
+        actor: &AuthUser,
+    ) -> Result<CredentialsStatusResponse, AdminServiceError> {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let manageable_owner_ids = self
+            .account_store
+            .manageable_account_ids(actor)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -85,6 +96,12 @@ impl AdminService {
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
+                registered_by: entry.registered_by,
+                registered_by_name: entry.registered_by_name.clone(),
+                can_manage: actor.role == Role::SuperAdmin
+                    || entry
+                        .registered_by
+                        .is_some_and(|id| manageable_owner_ids.contains(&id)),
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
             })
@@ -93,16 +110,48 @@ impl AdminService {
         // 按优先级排序（数字越小优先级越高）
         credentials.sort_by_key(|c| c.priority);
 
-        CredentialsStatusResponse {
+        Ok(CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+        })
+    }
+
+    fn require_manage_permission(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+    ) -> Result<(), AdminServiceError> {
+        let owner_id = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?
+            .registered_by;
+        if self
+            .account_store
+            .can_manage_credential(actor, owner_id)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(AdminServiceError::Forbidden(
+                "只能管理自己及下级代理登记的凭据".into(),
+            ))
         }
     }
 
     /// 设置凭据禁用状态
-    pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
+    pub fn set_disabled(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+        disabled: bool,
+    ) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
@@ -119,14 +168,21 @@ impl AdminService {
     }
 
     /// 设置凭据优先级
-    pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
+    pub fn set_priority(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+        priority: u32,
+    ) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
     }
 
     /// 重置失败计数并重新启用
-    pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub fn reset_and_enable(&self, actor: &AuthUser, id: u64) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
@@ -196,6 +252,7 @@ impl AdminService {
     /// 添加新凭据
     pub async fn add_credential(
         &self,
+        actor: &AuthUser,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
@@ -217,7 +274,7 @@ impl AdminService {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
-            profile_arn: None,
+            profile_arn: req.profile_arn,
             expires_at: None,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
@@ -234,6 +291,8 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
+            registered_by: Some(actor.id),
+            registered_by_name: Some(actor.username.clone()),
             endpoint: req.endpoint,
         };
 
@@ -245,6 +304,7 @@ impl AdminService {
             .map_err(|e| self.classify_add_error(e))?;
 
         // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        #[cfg(not(test))]
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
@@ -258,7 +318,8 @@ impl AdminService {
     }
 
     /// 删除凭据
-    pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub fn delete_credential(&self, actor: &AuthUser, id: u64) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
@@ -283,8 +344,14 @@ impl AdminService {
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
+        actor: &AuthUser,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
+        if actor.role != Role::SuperAdmin {
+            return Err(AdminServiceError::Forbidden(
+                "仅超级管理员可以修改负载均衡模式".into(),
+            ));
+        }
         // 验证模式值
         if req.mode != "priority" && req.mode != "balanced" {
             return Err(AdminServiceError::InvalidCredential(
@@ -300,7 +367,12 @@ impl AdminService {
     }
 
     /// 强制刷新指定凭据的 Token
-    pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub async fn force_refresh_token(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+    ) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
         self.token_manager
             .force_refresh_token_for(id)
             .await

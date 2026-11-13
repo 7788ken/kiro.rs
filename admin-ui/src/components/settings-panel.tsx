@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { KeyRound, Save } from 'lucide-react'
+import { CoreConfigPanel } from '@/components/core-config-panel'
 import { changeOwnKey, changePassword, setBilling } from '@/api/accounts'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
@@ -48,11 +49,14 @@ export function SettingsPanel({ account, onKeyChanged }: { account: AccountOverv
   }
 
   return (
-    <div className="grid gap-5 lg:grid-cols-2">
+    <div className="space-y-7">
+      {isSuperAdmin && <CoreConfigPanel />}
+      <div className="grid gap-5 lg:grid-cols-2">
       {isSuperAdmin && <Card><CardHeader><CardTitle className="text-base">计费单价</CardTitle><CardDescription>单位：积分 / 百万 token。请求开始时锁定价格，完成时按实际用量结算。</CardDescription></CardHeader><CardContent><form onSubmit={saveBilling} className="space-y-4"><div className="grid grid-cols-2 gap-4"><div className="space-y-2"><label htmlFor="input-rate" className="text-sm font-medium">输入单价</label><Input id="input-rate" type="number" min="0" step="0.000001" value={inputRate} onChange={event => setInputRate(event.target.value)} /></div><div className="space-y-2"><label htmlFor="output-rate" className="text-sm font-medium">输出单价</label><Input id="output-rate" type="number" min="0" step="0.000001" value={outputRate} onChange={event => setOutputRate(event.target.value)} /></div></div><Button disabled={pending}><Save />保存单价</Button></form></CardContent></Card>}
       <Card><CardHeader><CardTitle className="text-base">API Key</CardTitle><CardDescription>完整 Key 只在重置后展示一次，数据库仅保存哈希。</CardDescription></CardHeader><CardContent><Button variant="outline" disabled={pending} onClick={rotateKey}><KeyRound />重置我的 API Key</Button></CardContent></Card>
       <Card><CardHeader><CardTitle className="text-base">修改密码</CardTitle><CardDescription>修改后需要重新登录，API Key 也会轮换。</CardDescription></CardHeader><CardContent><form onSubmit={updatePassword} className="space-y-3"><Input type="password" value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} placeholder="当前密码" autoComplete="current-password" required /><Input type="password" value={newPassword} onChange={event => setNewPassword(event.target.value)} placeholder="新密码（至少 10 个字符）" autoComplete="new-password" minLength={10} required /><Button disabled={pending}>更新密码</Button></form></CardContent></Card>
       <KeyDialog apiKey={newKey} onClose={() => setNewKey('')} title="我的新 API Key" />
+      </div>
     </div>
   )
 }

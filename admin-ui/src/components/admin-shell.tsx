@@ -12,7 +12,6 @@ interface AdminShellProps {
   username: string
   role: string
   isManager: boolean
-  isSuperAdmin: boolean
   onLogout: () => void
   children: React.ReactNode
 }
@@ -21,7 +20,7 @@ export function roleName(role: string) {
   return role === 'super_admin' ? '超级管理员' : role === 'admin' ? '管理员' : '用户'
 }
 
-export function AdminShell({ section, onSectionChange, username, role, isManager, isSuperAdmin, onLogout, children }: AdminShellProps) {
+export function AdminShell({ section, onSectionChange, username, role, isManager, onLogout, children }: AdminShellProps) {
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
   const [mobileOpen, setMobileOpen] = useState(false)
 
@@ -44,7 +43,7 @@ export function AdminShell({ section, onSectionChange, username, role, isManager
     setMobileOpen(false)
   }
 
-  const navItems = sectionNavItems.filter(item => !item.requiresSuperAdmin && (!item.requiresManager || isManager) || item.requiresSuperAdmin && isSuperAdmin)
+  const navItems = sectionNavItems.filter(item => !item.requiresManager || isManager)
   const meta = sectionMeta[section]
 
   useEffect(() => {

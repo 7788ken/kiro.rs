@@ -57,6 +57,12 @@ pub struct CredentialStatusItem {
     pub proxy_url: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
+    /// 登记该凭据的管理员账户 ID
+    pub registered_by: Option<i64>,
+    /// 登记时的管理员名称
+    pub registered_by_name: Option<String>,
+    /// 当前登录管理员是否可管理该凭据
+    pub can_manage: bool,
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
@@ -102,6 +108,9 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// AWS Profile ARN（企业 IdC 的额度和 API 请求使用）
+    pub profile_arn: Option<String>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region

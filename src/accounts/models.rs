@@ -28,10 +28,18 @@ impl Role {
         }
     }
 
+    pub fn can_create(self, target: Self) -> bool {
+        match self {
+            Self::SuperAdmin => target != Self::SuperAdmin,
+            Self::Admin => target != Self::SuperAdmin,
+            Self::User => false,
+        }
+    }
+
     pub fn can_manage(self, target: Self) -> bool {
         match self {
             Self::SuperAdmin => target != Self::SuperAdmin,
-            Self::Admin => target == Self::User,
+            Self::Admin => target != Self::SuperAdmin,
             Self::User => false,
         }
     }
@@ -43,6 +51,7 @@ pub struct AuthUser {
     pub id: i64,
     pub username: String,
     pub role: Role,
+    pub parent_id: Option<i64>,
     pub balance_micro: i64,
     pub enabled: bool,
 }
@@ -59,6 +68,7 @@ pub struct UserView {
     pub id: i64,
     pub username: String,
     pub role: Role,
+    pub parent_id: Option<i64>,
     pub balance_micro: i64,
     pub enabled: bool,
     pub key_prefix: String,

@@ -15,9 +15,8 @@ use serde_json::Value;
 
 use crate::{
     accounts::{
-        AccountState,
+        AccountState, AccountStore,
         middleware::error_response,
-        AccountStore,
         models::{AuthUser, RequestLog, Reservation},
         store::AccountError,
     },
@@ -132,6 +131,13 @@ pub async fn billing_middleware(
             if matches!(error, AccountError::Internal(_)) {
                 tracing::error!("账户服务错误: {}", message);
             }
+            state.tracker.begin(&user, &path, &model, stream).finish(
+                http_status.as_u16(),
+                0,
+                0,
+                None,
+                Some(message.clone()),
+            );
             state.store.record_rejected_request(
                 &user,
                 &path,
@@ -147,10 +153,11 @@ pub async fn billing_middleware(
     let mut guard = BillingGuard::new(
         state.store.clone(),
         reservation,
-        path,
-        model,
+        path.clone(),
+        model.clone(),
         stream,
         started_at,
+        state.tracker.begin(&user, &path, &model, stream),
     );
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes)))
@@ -214,6 +221,7 @@ struct BillingGuard {
     output_tokens: i64,
     buffer: Vec<u8>,
     error_message: Option<String>,
+    live: Option<crate::admin::TrackedRequestGuard>,
     completed: bool,
 }
 
@@ -225,6 +233,7 @@ impl BillingGuard {
         model: String,
         stream: bool,
         started_at: Instant,
+        live: crate::admin::TrackedRequestGuard,
     ) -> Self {
         Self {
             store,
@@ -239,6 +248,7 @@ impl BillingGuard {
             output_tokens: 0,
             buffer: Vec::new(),
             error_message: None,
+            live: Some(live),
             completed: false,
         }
     }
@@ -253,6 +263,9 @@ impl BillingGuard {
         }
         if self.first_token_ms.is_none() && !chunk.is_empty() {
             self.first_token_ms = Some(elapsed_ms(self.started_at));
+            if let Some(live) = self.live.as_mut() {
+                live.first_token();
+            }
         }
         self.buffer.extend_from_slice(chunk);
         while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -279,6 +292,9 @@ impl BillingGuard {
             )
         {
             self.first_token_ms = Some(elapsed_ms(self.started_at));
+            if let Some(live) = self.live.as_mut() {
+                live.first_token();
+            }
         }
         if event_type == Some("error") || data.get("error").is_some() {
             let error = data.get("error").unwrap_or(data);
@@ -359,6 +375,15 @@ impl BillingGuard {
                 duration_ms: elapsed_ms(self.started_at),
                 first_token_ms: self.first_token_ms,
             };
+            if let Some(live) = self.live.take() {
+                live.finish(
+                    self.http_status,
+                    input,
+                    self.output_tokens,
+                    self.first_token_ms,
+                    self.error_message.clone(),
+                );
+            }
             if let Err(error) = self.store.settle(
                 &reservation,
                 success && self.error_message.is_none(),
@@ -391,6 +416,13 @@ fn rejected_request(
     message: String,
     started_at: Instant,
 ) -> Response {
+    state.tracker.begin(user, path, model, false).finish(
+        http_status.as_u16(),
+        0,
+        0,
+        None,
+        Some(message.clone()),
+    );
     state.store.record_rejected_request(
         user,
         path,

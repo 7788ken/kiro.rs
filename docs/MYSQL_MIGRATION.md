@@ -18,7 +18,7 @@ MYSQL_URL=mysql://kiro_rs_app:请替换为独立随机密码@new-api-mysql:3306/
 
 Compose 同时挂载 `config/` 和 `.env.mysql`，并连接到 MySQL 所在 Docker 网络。不要把 `.env.mysql`、真实数据库密码或备份提交到 Git。
 
-初始化表结构由应用启动自动完成；数据库、独立账号和最小权限需由管理员预先创建。MySQL 表使用 `utf8mb4`、InnoDB、外键及条件更新。计费预授权、实际结算、失败退款和重复结算保护均在事务内完成。
+初始化表结构由应用启动自动完成，包含账户上级 `parent_id` 的增量迁移；旧账户的上级为空，仅超管可管理。凭证归属 `registeredBy` 和登记人名称保存在 `credentials.json`，历史无归属凭证仅超管可管理。SQLite 导入 MySQL 时保留已有上级关系，没有该列的旧备份按无上级处理。数据库、独立账号和最小权限需由管理员预先创建。MySQL 表使用 `utf8mb4`、InnoDB、外键及条件更新。计费预授权、实际结算、失败退款和重复结算保护均在事务内完成。
 
 ## 本次迁移结果
 

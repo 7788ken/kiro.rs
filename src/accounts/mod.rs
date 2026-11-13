@@ -2,15 +2,15 @@ pub mod billing;
 #[cfg(test)]
 mod billing_tests;
 pub mod middleware;
-pub mod models;
-pub mod router;
-pub mod store;
 #[cfg(feature = "mysql")]
-pub mod mysql_store;
+pub mod migration;
+pub mod models;
 #[cfg(feature = "mysql")]
 pub mod mysql_account_store;
 #[cfg(feature = "mysql")]
-pub mod migration;
+pub mod mysql_store;
+pub mod router;
+pub mod store;
 #[cfg(feature = "mysql")]
 pub use mysql_account_store::AccountStore;
 #[cfg(not(feature = "mysql"))]

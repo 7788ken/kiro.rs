@@ -7,6 +7,7 @@ mod http_client;
 mod kiro;
 mod lifecycle;
 mod model;
+mod runtime_config;
 mod shared_files;
 pub mod token;
 
@@ -138,8 +139,12 @@ async fn main() {
     }
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
-    let token_manager = MultiTokenManager::new(
+    let runtime_config = std::sync::Arc::new(runtime_config::RuntimeConfig::new(
         config.clone(),
+        config_path.clone(),
+    ));
+    let token_manager = MultiTokenManager::new(
+        runtime_config.clone(),
         credentials_list,
         proxy_config.clone(),
         Some(credentials_path.into()),
@@ -170,12 +175,26 @@ async fn main() {
         config.extract_thinking,
         account_state.clone(),
     );
-    let admin_service = admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-    let admin_state = admin::AdminState::new(admin_key, admin_service);
-    let admin_app = admin::create_admin_router(admin_state).layer(middleware::from_fn_with_state(
+    let admin_service = admin::AdminService::new(
+        token_manager.clone(),
+        endpoint_names.clone(),
+        account_state.store.clone(),
+    );
+    let admin_state = admin::AdminState::new(
+        admin_key,
+        admin_service,
         account_state.clone(),
-        accounts::middleware::super_admin_auth_middleware,
-    ));
+        admin::core_config::CoreConfigService::new(
+            runtime_config,
+            token_manager.clone(),
+            anthropic::shared_app_state().clone(),
+            endpoint_names,
+        ),
+    );
+    let admin_app = admin::create_admin_router(admin_state.clone()).layer(
+        middleware::from_fn_with_state(admin_state, admin::admin_auth_middleware),
+    );
+    let admin_app = Router::new().merge(admin_app);
 
     let lifecycle = lifecycle::Lifecycle::default();
     let app = Router::new()

@@ -81,6 +81,10 @@ impl KiroProvider {
         }
     }
 
+    pub fn endpoints(&self) -> &HashMap<String, Arc<dyn KiroEndpoint>> {
+        &self.endpoints
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -140,7 +144,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -156,7 +160,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -303,7 +307,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -318,7 +322,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.api_url(&rctx);

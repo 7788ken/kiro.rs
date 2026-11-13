@@ -317,7 +317,7 @@ pub async fn post_messages(
     );
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
+        Some(p) => p.read().clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
             return (
@@ -423,7 +423,10 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = state
+            .extract_thinking
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && thinking_enabled;
         handle_non_stream_request(
             provider,
             &request_body,
@@ -841,7 +844,7 @@ pub async fn post_messages_cc(
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
+        Some(p) => p.read().clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
             return (
@@ -947,7 +950,10 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = state
+            .extract_thinking
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && thinking_enabled;
         handle_non_stream_request(
             provider,
             &request_body,

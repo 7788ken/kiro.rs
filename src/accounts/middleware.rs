@@ -8,16 +8,13 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use super::{
-    models::AuthUser,
-    AccountStore,
-    store::AccountError,
-};
+use super::{AccountStore, models::AuthUser, store::AccountError};
 use crate::{admin::types::AdminErrorResponse, anthropic::types::ErrorResponse, common::auth};
 
 #[derive(Clone)]
 pub struct AccountState {
     pub store: Arc<AccountStore>,
+    pub tracker: crate::admin::RequestTracker,
     pub legacy_admin_key: String,
     pub legacy_api_key: Option<String>,
 }
@@ -26,6 +23,7 @@ impl AccountState {
     pub fn new(store: Arc<AccountStore>, legacy_admin_key: impl Into<String>) -> Self {
         Self {
             store,
+            tracker: crate::admin::RequestTracker::new(),
             legacy_admin_key: legacy_admin_key.into(),
             legacy_api_key: None,
         }
@@ -123,21 +121,22 @@ pub async fn super_admin_auth_middleware(
         Ok(user) => user,
         Err(_) => return unauthorized(),
     };
-    match state.store.authenticate_session(user.id) {
-        Ok(user) if user.role == super::models::Role::SuperAdmin => {
-            let mut request = request;
-            request.extensions_mut().insert(user);
-            next.run(request).await
+    let user = match state.store.authenticate_session(user.id) {
+        Ok(user) if user.role == super::models::Role::SuperAdmin => user,
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(AdminErrorResponse::new(
+                    "forbidden",
+                    "仅超级管理员可以执行此操作",
+                )),
+            )
+                .into_response();
         }
-        _ => (
-            StatusCode::FORBIDDEN,
-            Json(AdminErrorResponse::new(
-                "forbidden",
-                "仅超级管理员可以管理上游凭据",
-            )),
-        )
-            .into_response(),
-    }
+    };
+    let mut request = request;
+    request.extensions_mut().insert(user);
+    next.run(request).await
 }
 
 pub fn error_response(error: AccountError) -> Response {

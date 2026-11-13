@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
+use crate::kiro::model::credentials::KiroCredentials;
 use anyhow::Context;
 use fs2::FileExt;
-use crate::kiro::model::credentials::KiroCredentials;
 
 pub fn merge_credential(
     original: Option<&KiroCredentials>,
@@ -15,7 +15,11 @@ pub fn merge_credential(
     let local = serde_json::to_value(local)?;
     let disk = serde_json::to_value(disk)?;
     let mut merged = disk.clone();
-    if let (Some(original), Some(local), Some(merged)) = (original.as_object(), local.as_object(), merged.as_object_mut()) {
+    if let (Some(original), Some(local), Some(merged)) = (
+        original.as_object(),
+        local.as_object(),
+        merged.as_object_mut(),
+    ) {
         for (field, local_value) in local {
             if original.get(field) != Some(local_value) {
                 merged.insert(field.clone(), local_value.clone());
@@ -42,7 +46,8 @@ pub fn merge_credentials(
         let original = snapshots.get(&id).and_then(|cred| cred.as_ref());
         let original_refresh = original.and_then(|cred| cred.refresh_token.as_deref());
         let current_refresh = current.refresh_token.as_deref();
-        if original_refresh != current_refresh && original_refresh != local.refresh_token.as_deref() {
+        if original_refresh != current_refresh && original_refresh != local.refresh_token.as_deref()
+        {
             merged.push(current);
             continue;
         }
@@ -89,7 +94,10 @@ impl Drop for FileLock {
 
 pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     let parent = path.parent().context("配置文件必须位于目录中")?;
-    let name = path.file_name().context("配置文件名无效")?.to_string_lossy();
+    let name = path
+        .file_name()
+        .context("配置文件名无效")?
+        .to_string_lossy();
     let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::write(&temporary, contents)
         .with_context(|| format!("写入临时配置失败: {}", temporary.display()))?;

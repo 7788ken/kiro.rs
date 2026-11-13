@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Search, LayoutGrid, List } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
@@ -15,13 +15,16 @@ import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingM
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
-import { EmptyState, MetricCard, PageSection } from '@/components/page-elements'
+import { CredentialList } from '@/components/credential-list'
+import { EmptyState, PageSection } from '@/components/page-elements'
+import { Input, formControlClass } from '@/components/ui/input'
 
 interface DashboardProps {
   onLogout: () => void
+  isSuperAdmin: boolean
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -40,6 +43,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [viewMode, setViewMode] = useState<'card' | 'list'>(() => localStorage.getItem('kiro-credential-view') === 'list' ? 'list' : 'card')
+  const [search, setSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [ownerFilter, setOwnerFilter] = useState<'all' | 'manageable' | 'readonly'>('all')
   const itemsPerPage = 12
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -48,12 +55,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const filteredCredentials = (data?.credentials || []).filter(credential => {
+    const keyword = search.trim().toLocaleLowerCase()
+    const matchesKeyword = !keyword || [credential.id.toString(), credential.email, credential.endpoint, credential.registeredByName, credential.maskedApiKey, credential.authMethod]
+      .some(value => value?.toLocaleLowerCase().includes(keyword))
+    const matchesStatus = statusFilter === 'all' || (statusFilter === 'disabled' ? credential.disabled : !credential.disabled)
+    const matchesOwner = ownerFilter === 'all' || (ownerFilter === 'manageable' ? credential.canManage : !credential.canManage)
+    return matchesKeyword && matchesStatus && matchesOwner
+  })
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
-  const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = filteredCredentials.slice(startIndex, startIndex + itemsPerPage)
+  const disabledCredentialCount = data?.credentials.filter(credential => credential.canManage && credential.disabled).length || 0
+  const manageableCount = data?.credentials.filter(credential => credential.canManage).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -62,7 +76,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [data?.credentials.length, search, statusFilter, ownerFilter])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -85,17 +99,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
 
     setLoadingBalanceIds(prev => {
-      if (prev.size === 0) {
-        return prev
-      }
       const next = new Set<number>()
       prev.forEach(id => {
-        if (validIds.has(id)) {
-          next.add(id)
-        }
+        if (validIds.has(id)) next.add(id)
       })
-      return next.size === prev.size ? prev : next
+      return next
     })
+    setSelectedIds(previous => new Set(Array.from(previous).filter(id => data.credentials.find(credential => credential.id === id)?.canManage)))
   }, [data?.credentials])
 
   const handleViewBalance = (id: number) => {
@@ -115,6 +125,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 选择管理
   const toggleSelect = (id: number) => {
+    if (!data?.credentials.find(credential => credential.id === id)?.canManage) return
     const newSelected = new Set(selectedIds)
     if (newSelected.has(id)) {
       newSelected.delete(id)
@@ -137,7 +148,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     const disabledIds = Array.from(selectedIds).filter(id => {
       const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.disabled)
+      return Boolean(credential?.canManage && credential.disabled)
     })
 
     if (disabledIds.length === 0) {
@@ -194,7 +205,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     const failedIds = Array.from(selectedIds).filter(id => {
       const cred = data?.credentials.find(c => c.id === id)
-      return cred && cred.failureCount > 0
+      return cred && cred.canManage && cred.failureCount > 0
     })
 
     if (failedIds.length === 0) {
@@ -242,7 +253,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     const enabledIds = Array.from(selectedIds).filter(id => {
       const cred = data?.credentials.find(c => c.id === id)
-      return cred && !cred.disabled
+      return cred && cred.canManage && !cred.disabled
     })
 
     if (enabledIds.length === 0) {
@@ -285,7 +296,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
+    const disabledCredentials = data.credentials.filter(credential => credential.canManage && credential.disabled)
 
     if (disabledCredentials.length === 0) {
       toast.error('没有可清除的已禁用凭据')
@@ -335,7 +346,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const ids = currentCredentials
-      .filter(credential => !credential.disabled)
+      .filter(credential => credential.canManage && !credential.disabled)
       .map(credential => credential.id)
 
     if (ids.length === 0) {
@@ -526,13 +537,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   return (
     <div className="space-y-7">
-      <div className="grid gap-4 sm:grid-cols-3">
-        <MetricCard label="凭据总数" value={data?.total || 0} detail={`${disabledCredentialCount} 个已禁用`} icon={Server} />
-        <MetricCard label="可用凭据" value={data?.available || 0} detail="可参与上游请求分配" icon={CheckCircle2} tone="success" />
-        <MetricCard label="当前活跃" value={`#${data?.currentId || '-'}`} detail={loadBalancingMode === 'priority' ? '按优先级顺序使用' : '在可用凭据间均衡分配'} icon={RotateCcw} tone="accent" />
-      </div>
-
-      <PageSection title="连接池" description="点击卡片中的优先级可直接编辑，禁用后才能删除凭据。" actions={<><Button variant="outline" size="sm" onClick={handleToggleLoadBalancing} disabled={isLoadingMode || isSettingMode}><RotateCcw />{loadBalancingMode === 'priority' ? '优先级模式' : '均衡负载'}</Button><Button variant="ghost" size="icon" title="刷新凭据列表" aria-label="刷新凭据列表" onClick={handleRefresh}><RefreshCw /></Button></>}>
+      <PageSection title="凭据列表" description="可查看全部凭证；只有本人及下级代理登记的凭证可以管理。" actions={<><Button variant="outline" size="sm" onClick={handleToggleLoadBalancing} disabled={!isSuperAdmin || isLoadingMode || isSettingMode} title={!isSuperAdmin ? '仅超级管理员可修改负载均衡模式' : undefined}><RotateCcw />{loadBalancingMode === 'priority' ? '优先级模式' : '均衡负载'}</Button><Button variant="ghost" size="icon" title="刷新凭据列表" aria-label="刷新凭据列表" onClick={handleRefresh}><RefreshCw /></Button></>}>
+        <div className="flex flex-col gap-3 rounded-xl bg-muted/35 p-3 lg:flex-row lg:items-center">
+          <div className="relative min-w-0 flex-1"><Search className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-muted-foreground" /><Input aria-label="搜索凭据" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索邮箱、ID、端点或登记人" className="pl-9" /></div>
+          <div className="grid grid-cols-2 gap-2 sm:flex">
+            <select aria-label="按状态筛选" className={formControlClass + ' sm:w-32'} value={statusFilter} onChange={event => setStatusFilter(event.target.value as typeof statusFilter)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已禁用</option></select>
+            <select aria-label="按管理权限筛选" className={formControlClass + ' sm:w-40'} value={ownerFilter} onChange={event => setOwnerFilter(event.target.value as typeof ownerFilter)}><option value="all">全部归属</option><option value="manageable">我可管理</option><option value="readonly">仅可查看</option></select>
+          </div>
+          {(search || statusFilter !== 'all' || ownerFilter !== 'all') && <Button variant="ghost" size="sm" onClick={() => { setSearch(''); setStatusFilter('all'); setOwnerFilter('all') }}>清除筛选</Button>}
+        </div>
+        <p className="text-xs tabular-nums text-muted-foreground">找到 {filteredCredentials.length} 个凭证 · 当前分支可管理 {manageableCount} 个</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm font-medium">卡片 / 列表</p>
+          <div className="flex rounded-lg bg-muted p-1" role="group" aria-label="凭据视图"><Button variant={viewMode === 'card' ? 'outline' : 'ghost'} size="sm" aria-pressed={viewMode === 'card'} onClick={() => { setViewMode('card'); localStorage.setItem('kiro-credential-view', 'card') }}><LayoutGrid />卡片</Button><Button variant={viewMode === 'list' ? 'outline' : 'ghost'} size="sm" aria-pressed={viewMode === 'list'} onClick={() => { setViewMode('list'); localStorage.setItem('kiro-credential-view', 'list') }}><List />列表</Button></div>
+        </div>
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" onClick={() => setKamImportDialogOpen(true)}><FileUp />KAM 导入</Button>
@@ -550,12 +568,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {data?.credentials.length === 0 ? (
           <Card><CardContent className="p-0"><EmptyState icon={Server} title="还没有上游凭据" description="添加 Kiro OAuth 或 API Key 凭据，建立可供用户请求使用的连接池。" action={<Button onClick={() => setAddDialogOpen(true)}><Plus />添加第一个凭据</Button>} /></CardContent></Card>
+        ) : filteredCredentials.length === 0 ? (
+          <Card><CardContent className="p-0"><EmptyState icon={Search} title="没有匹配的凭证" description="尝试更换关键词、状态或归属筛选条件。" action={<Button variant="outline" onClick={() => { setSearch(''); setStatusFilter('all'); setOwnerFilter('all') }}>清除筛选</Button>} /></CardContent></Card>
         ) : (
           <>
-            <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+            {viewMode === 'card' ? <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
               {currentCredentials.map(credential => <CredentialCard key={credential.id} credential={credential} onViewBalance={handleViewBalance} selected={selectedIds.has(credential.id)} onToggleSelect={() => toggleSelect(credential.id)} balance={balanceMap.get(credential.id) || null} loadingBalance={loadingBalanceIds.has(credential.id)} />)}
-            </div>
-            {totalPages > 1 && <div className="flex flex-wrap items-center justify-center gap-3 pt-2"><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}>上一页</Button><span className="text-sm text-muted-foreground tabular-nums">第 {currentPage} / {totalPages} 页 · 共 {data?.credentials.length} 个</span><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>下一页</Button></div>}
+            </div> : <CredentialList credentials={currentCredentials} onViewBalance={handleViewBalance} selectedIds={selectedIds} onToggleSelect={toggleSelect} balanceMap={balanceMap} loadingBalanceIds={loadingBalanceIds} />}
+            {totalPages > 1 && <div className="flex flex-wrap items-center justify-center gap-3 pt-2"><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}>上一页</Button><span className="text-sm text-muted-foreground tabular-nums">第 {currentPage} / {totalPages} 页 · 共 {filteredCredentials.length} 个</span><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>下一页</Button></div>}
           </>
         )}
       </PageSection>

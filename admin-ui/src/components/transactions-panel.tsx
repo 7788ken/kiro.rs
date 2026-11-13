@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, CircleAlert, Coins, ReceiptText } from 'lucide-react'
 import { getCreditChanges, getTransactions, getUsers } from '@/api/accounts'
-import type { CreditChange, CreditTransaction } from '@/types/accounts'
+import type { CreditChange, CreditTransaction, AuthUser } from '@/types/accounts'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,7 @@ import { EmptyState, PageSection, tableCellClass, tableClass, tableHeadClass, ta
 
 type LogStatus = 'success' | 'error' | 'pending'
 
-export function TransactionsPanel({ isManager }: { isManager: boolean }) {
+export function TransactionsPanel({ isManager, currentUser }: { isManager: boolean; currentUser: AuthUser }) {
   const [userId, setUserId] = useState<number | undefined>()
   const [view, setView] = useState<'calls' | 'adjustments'>('calls')
   const [selected, setSelected] = useState<CreditTransaction | null>(null)
@@ -22,7 +22,7 @@ export function TransactionsPanel({ isManager }: { isManager: boolean }) {
   const changesQuery = useQuery({ queryKey: ['credit-adjustments', userId ?? 'all'], queryFn: () => getCreditChanges(userId), enabled: view === 'adjustments' })
   const transactions = callsQuery.data ?? []
   const changes = changesQuery.data ?? []
-  const userFilter = isManager && <select aria-label="筛选用户" className={formControlClass + ' sm:w-52'} value={userId ?? ''} onChange={event => setUserId(event.target.value ? Number(event.target.value) : undefined)}><option value="">全部用户</option>{users.map(user => <option value={user.id} key={user.id}>{user.username}</option>)}</select>
+  const userFilter = isManager && <select aria-label="筛选用户" className={formControlClass + ' sm:w-52'} value={userId ?? ''} onChange={event => setUserId(event.target.value ? Number(event.target.value) : undefined)}><option value="">全部用户</option>{users.map(user => <option value={user.id} key={user.id}>{user.parentId === currentUser.id ? `${user.username}（直属下级）` : user.id === currentUser.id ? `${user.username}（我）` : user.username}</option>)}</select>
 
   return (
     <PageSection title={view === 'calls' ? '调用日志' : '充值与调整'} description={view === 'calls' ? '每次调用一条记录，失败不计费；点击记录查看首字、用量与积分结算明细。' : '查看开户初始积分与管理员手工调整，不包含 API 调用。'} actions={userFilter}>

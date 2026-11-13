@@ -27,6 +27,9 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  registeredBy?: number
+  registeredByName?: string
+  canManage: boolean
 }
 
 // 余额响应
@@ -69,7 +72,9 @@ export interface AddCredentialRequest {
   authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string
   clientSecret?: string
+  email?: string
   priority?: number
+  profileArn?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string

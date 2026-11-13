@@ -62,7 +62,8 @@ impl AccountStore {
                 role TEXT NOT NULL CHECK (role IN ('super_admin', 'admin', 'user')),
                 balance_micro INTEGER NOT NULL DEFAULT 0 CHECK (balance_micro >= 0),
                 enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                parent_id INTEGER REFERENCES users(id)
             );
             CREATE TABLE IF NOT EXISTS billing_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -108,6 +109,12 @@ impl AccountStore {
             connection: Mutex::new(connection),
         };
         let connection = store.connection.lock();
+        ensure_column(
+            &connection,
+            "users",
+            "parent_id",
+            "INTEGER REFERENCES users(id)",
+        )?;
         for (column, definition) in [
             ("request_id", "TEXT"),
             ("path", "TEXT"),
@@ -160,16 +167,16 @@ impl AccountStore {
     pub fn super_admin(&self) -> Result<AuthUser, AccountError> {
         let connection = self.connection.lock();
         connection.query_row(
-            "SELECT id, username, role, balance_micro, enabled FROM users WHERE role = 'super_admin' ORDER BY id LIMIT 1",
+            "SELECT id, username, role, balance_micro, enabled, parent_id FROM users WHERE role = 'super_admin' ORDER BY id LIMIT 1",
             [],
-            |row| Ok(AuthUser { id: row.get(0)?, username: row.get(1)?, role: Role::SuperAdmin, balance_micro: row.get(3)?, enabled: row.get::<_, i64>(4)? != 0 }),
+            |row| Ok(AuthUser { id: row.get(0)?, username: row.get(1)?, role: Role::SuperAdmin, balance_micro: row.get(3)?, enabled: row.get::<_, i64>(4)? != 0, parent_id: row.get(5)? }),
         ).optional()?.filter(|user| user.enabled).ok_or_else(|| AccountError::Internal("超级管理员未初始化或已禁用".into()))
     }
 
     pub fn authenticate_key(&self, key: &str) -> Result<Option<AuthUser>, AccountError> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT id, username, role, balance_micro, enabled FROM users WHERE api_key_hash = ?1",
+            "SELECT id, username, role, balance_micro, enabled, parent_id FROM users WHERE api_key_hash = ?1",
         )?;
         let result = statement
             .query_row([key_hash(key)], |row| {
@@ -179,6 +186,7 @@ impl AccountStore {
                     role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
                     balance_micro: row.get(3)?,
                     enabled: row.get::<_, i64>(4)? != 0,
+                    parent_id: row.get(5)?,
                 })
             })
             .optional()?;
@@ -193,7 +201,7 @@ impl AccountStore {
         let connection = self.connection.lock();
         let result = connection
             .query_row(
-                "SELECT id, username, password_hash, role, balance_micro, enabled FROM users WHERE username = ?1",
+                "SELECT id, username, password_hash, role, balance_micro, enabled, parent_id FROM users WHERE username = ?1",
                 [username.trim()],
                 |row| {
                     Ok((
@@ -203,6 +211,7 @@ impl AccountStore {
                             role: Role::parse(&row.get::<_, String>(3)?).unwrap_or(Role::User),
                             balance_micro: row.get(4)?,
                             enabled: row.get::<_, i64>(5)? != 0,
+                            parent_id: row.get(6)?,
                         },
                         row.get::<_, String>(2)?,
                     ))
@@ -309,7 +318,7 @@ impl AccountStore {
         role: Role,
         initial_balance: f64,
     ) -> Result<(UserView, String), AccountError> {
-        if !actor.role.can_manage(role) {
+        if !actor.role.can_create(role) {
             return Err(AccountError::Forbidden("无权创建该角色的账户".into()));
         }
         let username = username.trim();
@@ -329,9 +338,9 @@ impl AccountStore {
         let connection = self.connection.lock();
         let transaction = connection.unchecked_transaction()?;
         let result = transaction.execute(
-            "INSERT INTO users (username, password_hash, api_key_hash, key_prefix, role, balance_micro, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![username, hash_password(password)?, key_hash(&api_key), key_prefix(&api_key), role.as_str(), amount, now()],
+            "INSERT INTO users (username, password_hash, api_key_hash, key_prefix, role, balance_micro, created_at, parent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![username, hash_password(password)?, key_hash(&api_key), key_prefix(&api_key), role.as_str(), amount, now(), actor.id],
         );
         if let Err(error) = result {
             return if error.to_string().contains("UNIQUE") {
@@ -365,13 +374,17 @@ impl AccountStore {
         }
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT id, username, role, balance_micro, enabled, key_prefix, created_at FROM users ORDER BY id",
+            "SELECT id, username, role, balance_micro, enabled, parent_id, key_prefix, created_at FROM users ORDER BY id",
         )?;
         let rows = statement.query_map([], user_view_row)?;
+        let visible_ids = visible_user_ids(&connection, actor)?;
         let mut users = Vec::new();
         for row in rows {
             let mut user = row?;
-            if actor.role == Role::Admin && user.role != Role::User && user.id != actor.id {
+            if visible_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&user.id))
+            {
                 continue;
             }
             add_usage(&connection, &mut user)?;
@@ -383,7 +396,7 @@ impl AccountStore {
     pub fn get_user_view(&self, id: i64) -> Result<UserView, AccountError> {
         let connection = self.connection.lock();
         let mut user = connection.query_row(
-            "SELECT id, username, role, balance_micro, enabled, key_prefix, created_at FROM users WHERE id = ?1",
+            "SELECT id, username, role, balance_micro, enabled, parent_id, key_prefix, created_at FROM users WHERE id = ?1",
             [id],
             user_view_row,
         ).optional()?.ok_or(AccountError::NotFound)?;
@@ -399,6 +412,11 @@ impl AccountStore {
         role: Option<Role>,
     ) -> Result<UserView, AccountError> {
         let target = self.get_user_view(id)?;
+        if actor.role == Role::Admin && !self.is_descendant(actor.id, id)? {
+            return Err(AccountError::Forbidden(
+                "只能管理自己及下级代理的账户".into(),
+            ));
+        }
         if actor.id == id && (enabled == Some(false) || role.is_some_and(|r| r != actor.role)) {
             return Err(AccountError::InvalidInput(
                 "不能禁用自己的账户或修改自己的角色".into(),
@@ -420,6 +438,11 @@ impl AccountStore {
 
     pub fn regenerate_key(&self, actor: &AuthUser, id: i64) -> Result<String, AccountError> {
         let target = self.get_user_view(id)?;
+        if actor.role == Role::Admin && actor.id != id && !self.is_descendant(actor.id, id)? {
+            return Err(AccountError::Forbidden(
+                "只能管理自己及下级代理的账户".into(),
+            ));
+        }
         if actor.id != id && !actor.role.can_manage(target.role) {
             return Err(AccountError::Forbidden("无权重置该账户的 API Key".into()));
         }
@@ -445,6 +468,11 @@ impl AccountStore {
             ));
         }
         let target = self.get_user_view(id)?;
+        if actor.role == Role::Admin && !self.is_descendant(actor.id, id)? {
+            return Err(AccountError::Forbidden(
+                "只能管理自己及下级代理的账户".into(),
+            ));
+        }
         if !actor.role.can_manage(target.role) {
             return Err(AccountError::Forbidden("无权调整该账户的积分".into()));
         }
@@ -536,14 +564,36 @@ impl AccountStore {
         })
     }
 
+    fn ensure_transaction_access(
+        &self,
+        actor: &AuthUser,
+        requested_user: Option<i64>,
+    ) -> Result<(), AccountError> {
+        if actor.role == Role::SuperAdmin {
+            return Ok(());
+        }
+        match requested_user {
+            Some(user_id) if self.can_manage_account(actor, user_id)? => Ok(()),
+            Some(_) => Err(AccountError::Forbidden(
+                "只能查看自己及下级代理的流水".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
     pub fn list_transactions(
         &self,
         actor: &AuthUser,
         requested_user: Option<i64>,
         limit: u32,
     ) -> Result<Vec<TransactionView>, AccountError> {
+        self.ensure_transaction_access(actor, requested_user)?;
         let user_id = if actor.is_manager() {
-            requested_user
+            match requested_user {
+                Some(_) => requested_user,
+                None if actor.role == Role::SuperAdmin => None,
+                None => Some(actor.id),
+            }
         } else {
             Some(actor.id)
         };
@@ -572,6 +622,88 @@ impl AccountStore {
             }
         }
         Ok(rows)
+    }
+
+    pub fn usage_stats(
+        &self,
+        actor: &AuthUser,
+        start: &str,
+        end: &str,
+        group_by: &str,
+        requested_user: Option<i64>,
+        limit: u32,
+    ) -> Result<crate::admin::usage_types::UsageStatsResponse, AccountError> {
+        self.ensure_transaction_access(actor, requested_user)?;
+        let group_expression = match group_by {
+            "day" => "strftime('%Y-%m-%d', COALESCE(t.completed_at, t.created_at), '+8 hours')",
+            "user" => "u.username",
+            "model" => "COALESCE(t.model, '未知模型')",
+            "status" => {
+                "CASE WHEN t.http_status >= 400 OR t.kind = 'error' THEN '失败' ELSE '成功' END"
+            }
+            _ => return Err(AccountError::InvalidInput("不支持的统计维度".into())),
+        };
+        let visible = visible_user_ids(&self.connection.lock(), actor)?;
+        let scope = if let Some(ids) = visible {
+            if let Some(user_id) = requested_user {
+                format!(" AND t.user_id = {}", user_id)
+            } else {
+                format!(
+                    " AND t.user_id IN ({})",
+                    ids.into_iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        } else {
+            String::new()
+        };
+        let filter = format!(
+            "WHERE t.kind IN ('charge', 'error') AND t.status = 'settled' AND COALESCE(t.completed_at, t.created_at) >= ?1 AND COALESCE(t.completed_at, t.created_at) < ?2{scope}"
+        );
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(&format!("SELECT {group_expression}, COUNT(*), SUM(CASE WHEN t.http_status >= 400 OR t.kind = 'error' THEN 0 ELSE 1 END), SUM(CASE WHEN t.http_status >= 400 OR t.kind = 'error' THEN 1 ELSE 0 END), SUM(t.input_tokens), SUM(t.output_tokens), SUM(t.input_tokens + t.output_tokens), SUM(MAX(-t.amount_micro, 0)), AVG(t.duration_ms), AVG(t.first_token_ms) FROM credit_transactions t JOIN users u ON u.id = t.user_id {filter} GROUP BY {group_expression} ORDER BY SUM(t.input_tokens + t.output_tokens) DESC, COUNT(*) DESC LIMIT ?3"))?;
+        let groups = statement
+            .query_map(params![start, end, limit.min(200)], |row| {
+                Ok(crate::admin::usage_types::UsageGroup {
+                    key: row.get(0)?,
+                    requests: row.get(1)?,
+                    successful_requests: row.get(2)?,
+                    failed_requests: row.get(3)?,
+                    input_tokens: row.get(4)?,
+                    output_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                    spent_micro: row.get(7)?,
+                    average_duration_ms: row
+                        .get::<_, Option<f64>>(8)?
+                        .map(|value| value.round() as i64),
+                    average_first_token_ms: row
+                        .get::<_, Option<f64>>(9)?
+                        .map(|value| value.round() as i64),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let totals = connection.query_row(
+            &format!("SELECT COUNT(*), COALESCE(SUM(CASE WHEN t.http_status >= 400 OR t.kind = 'error' THEN 0 ELSE 1 END), 0), COALESCE(SUM(CASE WHEN t.http_status >= 400 OR t.kind = 'error' THEN 1 ELSE 0 END), 0), COUNT(DISTINCT t.user_id), COALESCE(SUM(t.input_tokens), 0), COALESCE(SUM(t.output_tokens), 0), COALESCE(SUM(t.input_tokens + t.output_tokens), 0), COALESCE(SUM(MAX(-t.amount_micro, 0)), 0) FROM credit_transactions t JOIN users u ON u.id = t.user_id {filter}"),
+            params![start, end],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, i64>(7)?)),
+        )?;
+        Ok(crate::admin::usage_types::UsageStatsResponse {
+            start_date: start.into(),
+            end_date: end.into(),
+            time_zone: "Asia/Shanghai".into(),
+            group_by: group_by.into(),
+            total_requests: totals.0,
+            successful_requests: totals.1,
+            failed_requests: totals.2,
+            active_users: totals.3,
+            input_tokens: totals.4,
+            output_tokens: totals.5,
+            total_tokens: totals.6,
+            spent_micro: totals.7,
+            groups,
+        })
     }
 
     pub fn reserve(
@@ -709,6 +841,50 @@ impl AccountStore {
         }
     }
 
+    pub fn can_manage_account(
+        &self,
+        actor: &AuthUser,
+        target_id: i64,
+    ) -> Result<bool, AccountError> {
+        if actor.role == Role::SuperAdmin || actor.id == target_id {
+            return Ok(true);
+        }
+        if !actor.is_manager() {
+            return Ok(false);
+        }
+        self.is_descendant(actor.id, target_id)
+    }
+
+    pub fn can_manage_credential(
+        &self,
+        actor: &AuthUser,
+        owner_id: Option<i64>,
+    ) -> Result<bool, AccountError> {
+        if actor.role == Role::SuperAdmin {
+            return Ok(true);
+        }
+        match owner_id {
+            Some(owner_id) => self.can_manage_account(actor, owner_id),
+            None => Ok(false),
+        }
+    }
+
+    fn is_descendant(&self, ancestor_id: i64, target_id: i64) -> Result<bool, AccountError> {
+        if ancestor_id == target_id {
+            return Ok(true);
+        }
+        let connection = self.connection.lock();
+        is_descendant(&connection, ancestor_id, target_id)
+    }
+
+    pub fn manageable_account_ids(
+        &self,
+        actor: &AuthUser,
+    ) -> Result<std::collections::HashSet<i64>, AccountError> {
+        let connection = self.connection.lock();
+        visible_user_ids(&connection, actor).map(|ids| ids.unwrap_or_default())
+    }
+
     pub fn record_rejected_request(
         &self,
         user: &AuthUser,
@@ -735,8 +911,13 @@ impl AccountStore {
         requested_user: Option<i64>,
         limit: u32,
     ) -> Result<Vec<CreditChangeView>, AccountError> {
+        self.ensure_transaction_access(actor, requested_user)?;
         let user_id = if actor.is_manager() {
-            requested_user
+            match requested_user {
+                Some(_) => requested_user,
+                None if actor.role == Role::SuperAdmin => None,
+                None => Some(actor.id),
+            }
         } else {
             Some(actor.id)
         };
@@ -763,10 +944,67 @@ impl AccountStore {
     }
 }
 
+fn visible_user_ids(
+    connection: &Connection,
+    actor: &AuthUser,
+) -> Result<Option<std::collections::HashSet<i64>>, AccountError> {
+    if actor.role == Role::SuperAdmin {
+        return Ok(None);
+    }
+    let mut statement = connection.prepare("SELECT id, parent_id FROM users")?;
+    let relations = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    let mut children = std::collections::HashMap::<i64, Vec<i64>>::new();
+    for relation in relations {
+        let (id, parent_id) = relation?;
+        if let Some(parent_id) = parent_id {
+            children.entry(parent_id).or_default().push(id);
+        }
+    }
+    let mut visible = std::collections::HashSet::from([actor.id]);
+    let mut pending = vec![actor.id];
+    while let Some(parent_id) = pending.pop() {
+        if let Some(child_ids) = children.get(&parent_id) {
+            for id in child_ids {
+                if visible.insert(*id) {
+                    pending.push(*id);
+                }
+            }
+        }
+    }
+    Ok(Some(visible))
+}
+
+fn is_descendant(
+    connection: &Connection,
+    ancestor_id: i64,
+    target_id: i64,
+) -> Result<bool, AccountError> {
+    let mut current_id = target_id;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current_id) {
+        let parent_id = connection
+            .query_row(
+                "SELECT parent_id FROM users WHERE id = ?1",
+                [current_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        match parent_id {
+            Some(id) if id == ancestor_id => return Ok(true),
+            Some(id) => current_id = id,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 fn get_user(connection: &Connection, id: i64) -> Result<AuthUser, AccountError> {
     connection
         .query_row(
-            "SELECT id, username, role, balance_micro, enabled FROM users WHERE id = ?1",
+            "SELECT id, username, role, balance_micro, enabled, parent_id FROM users WHERE id = ?1",
             [id],
             |row| {
                 Ok(AuthUser {
@@ -775,6 +1013,7 @@ fn get_user(connection: &Connection, id: i64) -> Result<AuthUser, AccountError> 
                     role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
                     balance_micro: row.get(3)?,
                     enabled: row.get::<_, i64>(4)? != 0,
+                    parent_id: row.get(5)?,
                 })
             },
         )
@@ -789,8 +1028,9 @@ fn user_view_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserView> {
         role: Role::parse(&row.get::<_, String>(2)?).unwrap_or(Role::User),
         balance_micro: row.get(3)?,
         enabled: row.get::<_, i64>(4)? != 0,
-        key_prefix: row.get(5)?,
-        created_at: row.get(6)?,
+        parent_id: row.get(5)?,
+        key_prefix: row.get(6)?,
+        created_at: row.get(7)?,
         total_input_tokens: 0,
         total_output_tokens: 0,
         total_spent_micro: 0,
@@ -1042,6 +1282,52 @@ mod tests {
     }
 
     #[test]
+    fn usage_stats_use_beijing_days_and_count_distinct_users() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, first_key) = store
+            .create_user(&manager, "usage-first", "password-123", Role::User, 10.0)
+            .unwrap();
+        let (_, second_key) = store
+            .create_user(&manager, "usage-second", "password-123", Role::User, 10.0)
+            .unwrap();
+        for (key, timestamp, model) in [
+            (&first_key, "2026-11-12T15:59:59Z", "previous-day"),
+            (&first_key, "2026-11-12T16:00:00Z", "sonnet"),
+            (&second_key, "2026-11-13T15:59:59.999Z", "sonnet"),
+        ] {
+            let user = store.authenticate_key(key).unwrap().unwrap();
+            let reservation = store.reserve(&user, model, 1000, 1000).unwrap().unwrap();
+            store.settle(&reservation, true, 100, 100, None).unwrap();
+            store
+                .connection
+                .lock()
+                .execute(
+                    "UPDATE credit_transactions SET completed_at = ?1 WHERE id = ?2",
+                    params![timestamp, reservation.id],
+                )
+                .unwrap();
+        }
+        let stats = store
+            .usage_stats(
+                &manager,
+                "2026-11-12T16:00:00+00:00",
+                "2026-11-13T16:00:00+00:00",
+                "day",
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.active_users, 2);
+        assert_eq!(stats.total_tokens, 400);
+        assert_eq!(stats.spent_micro, 12_000);
+        assert_eq!(stats.groups.len(), 1);
+        assert_eq!(stats.groups[0].key, "2026-11-13");
+        assert_eq!(stats.time_zone, "Asia/Shanghai");
+    }
+
+    #[test]
     fn role_and_credit_permissions_are_enforced() {
         let store = store();
         let super_admin = manager(&store);
@@ -1052,7 +1338,7 @@ mod tests {
         assert!(
             store
                 .create_user(&admin, "other-admin", "password-123", Role::Admin, 0.0)
-                .is_err()
+                .is_ok()
         );
         assert!(store.adjust_credits(&admin, admin.id, 100.0, None).is_err());
         assert!(

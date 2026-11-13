@@ -24,10 +24,11 @@
 
 mod converter;
 mod handlers;
+pub use middleware::AppState;
 mod middleware;
 mod router;
 mod stream;
 pub mod types;
 mod websearch;
 
-pub use router::create_router_with_accounts;
+pub use router::{create_router_with_accounts, shared_app_state};

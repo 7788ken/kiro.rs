@@ -23,9 +23,9 @@ export function AccountDashboard({ initialAccount, section, onSectionChange, onL
     <div className="animate-in fade-in-0 duration-200" key={section}>
       {section === 'users' && isManager && <UsersPanel currentUser={account.user} />}
       {section === 'overview' && <Overview account={account} transactionCount={transactions.length} onShowTransactions={() => onSectionChange('transactions')} />}
-      {section === 'transactions' && <TransactionsPanel isManager={isManager} />}
+      {section === 'transactions' && <TransactionsPanel isManager={isManager} currentUser={account.user} />}
       {section === 'settings' && <SettingsPanel account={account} onKeyChanged={onLogout} />}
-      {section === 'credentials' && <div className="rounded-xl border bg-card p-5 text-sm text-muted-foreground">上游凭据仅超级管理员可管理。</div>}
+      {section === 'credentials' && <div className="rounded-xl border bg-card p-5 text-sm text-muted-foreground">普通管理员可查看和搜索凭据，并管理本人及下级代理登记的凭据。</div>}
     </div>
   )
 }

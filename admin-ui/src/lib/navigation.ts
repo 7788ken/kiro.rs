@@ -1,24 +1,28 @@
 import { useEffect, useState } from 'react'
-import { ReceiptText, Settings2, ShieldCheck, UsersRound, Wallet, type LucideIcon } from 'lucide-react'
+import { ReceiptText, Settings2, ShieldCheck, UsersRound, Wallet, BarChart3, Activity, type LucideIcon } from 'lucide-react'
 
-export const adminSections = ['credentials', 'users', 'overview', 'transactions', 'settings'] as const
+export const adminSections = ['monitor', 'credentials', 'usage', 'users', 'overview', 'transactions', 'settings'] as const
 export type AdminSection = typeof adminSections[number]
 
 export const sectionMeta: Record<AdminSection, { title: string; description: string }> = {
-  credentials: { title: '上游凭据', description: '管理 Kiro 连接池、订阅额度与请求分配策略。' },
-  users: { title: '用户与额度', description: '创建独立账户、分配 API Key 并管理积分额度。' },
+  monitor: { title: '运行概览', description: '查看实时请求速率、当前并发、最近调用及上游凭据池状态。' },
+  credentials: { title: '上游凭据', description: '搜索、筛选和管理本人及下级代理登记的凭证。' },
+  usage: { title: '用量统计', description: '按日期、用户、模型和状态聚合 Token、积分消耗与请求趋势。' },
+  users: { title: '用户与额度', description: '创建下级代理或普通用户，管理自己分支内的账户与积分。' },
   overview: { title: '我的账户', description: '查看账户余额、Token 用量与当前计费标准。' },
   transactions: { title: '积分流水', description: '查看每次调用的消费与错误状态，追踪首字、Token、预扣、返还及余额。' },
   settings: { title: '安全与设置', description: '管理登录密码、API Key 与平台计费规则。' },
 }
 
 export const sectionNavItems = [
-  { id: 'credentials', label: '上游凭据', icon: ShieldCheck, requiresSuperAdmin: true },
+  { id: 'monitor', label: '运行概览', icon: Activity, requiresManager: true },
+  { id: 'credentials', label: '上游凭据', icon: ShieldCheck, requiresManager: true },
+  { id: 'usage', label: '用量统计', icon: BarChart3 },
   { id: 'users', label: '用户与额度', icon: UsersRound, requiresManager: true },
   { id: 'overview', label: '我的账户', icon: Wallet },
   { id: 'transactions', label: '积分流水', icon: ReceiptText },
   { id: 'settings', label: '安全与设置', icon: Settings2 },
-] satisfies { id: AdminSection; label: string; icon: LucideIcon; requiresSuperAdmin?: boolean; requiresManager?: boolean }[]
+] satisfies { id: AdminSection; label: string; icon: LucideIcon; requiresManager?: boolean }[]
 
 export function sectionPath(section: AdminSection) {
   return `/admin/${section}`

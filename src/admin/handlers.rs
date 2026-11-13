@@ -1,10 +1,13 @@
 //! Admin API HTTP 处理器
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     response::IntoResponse,
 };
+
+use super::core_config;
+use crate::accounts::AuthUser;
 
 use super::{
     middleware::AdminState,
@@ -16,9 +19,15 @@ use super::{
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
-pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
-    Json(response)
+pub async fn get_all_credentials(
+    State(state): State<AdminState>,
+    Extension(user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    let response = state.service.get_all_credentials(&user);
+    match response {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -26,9 +35,10 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
 pub async fn set_credential_disabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
     Json(payload): Json<SetDisabledRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_disabled(id, payload.disabled) {
+    match state.service.set_disabled(&user, id, payload.disabled) {
         Ok(_) => {
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
@@ -42,9 +52,10 @@ pub async fn set_credential_disabled(
 pub async fn set_credential_priority(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
     Json(payload): Json<SetPriorityRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_priority(id, payload.priority) {
+    match state.service.set_priority(&user, id, payload.priority) {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
@@ -59,8 +70,9 @@ pub async fn set_credential_priority(
 pub async fn reset_failure_count(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
 ) -> impl IntoResponse {
-    match state.service.reset_and_enable(id) {
+    match state.service.reset_and_enable(&user, id) {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 失败计数已重置并重新启用",
             id
@@ -86,9 +98,10 @@ pub async fn get_credential_balance(
 /// 添加新凭据
 pub async fn add_credential(
     State(state): State<AdminState>,
+    Extension(user): Extension<AuthUser>,
     Json(payload): Json<AddCredentialRequest>,
 ) -> impl IntoResponse {
-    match state.service.add_credential(payload).await {
+    match state.service.add_credential(&user, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -99,8 +112,9 @@ pub async fn add_credential(
 pub async fn delete_credential(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
 ) -> impl IntoResponse {
-    match state.service.delete_credential(id) {
+    match state.service.delete_credential(&user, id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -111,13 +125,54 @@ pub async fn delete_credential(
 pub async fn force_refresh_token(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
 ) -> impl IntoResponse {
-    match state.service.force_refresh_token(id).await {
+    match state.service.force_refresh_token(&user, id).await {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} Token 已强制刷新",
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/core
+pub async fn get_core_config(
+    State(state): State<AdminState>,
+    Extension(user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    if user.role != crate::accounts::Role::SuperAdmin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(super::types::AdminErrorResponse::new(
+                "forbidden",
+                "仅超级管理员可以查看核心配置",
+            )),
+        )
+            .into_response();
+    }
+    Json(state.core_config.get()).into_response()
+}
+
+/// PUT /api/admin/config/core
+pub async fn update_core_config(
+    State(state): State<AdminState>,
+    Extension(user): Extension<AuthUser>,
+    Json(payload): Json<core_config::UpdateCoreConfigRequest>,
+) -> impl IntoResponse {
+    if user.role != crate::accounts::Role::SuperAdmin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(super::types::AdminErrorResponse::new(
+                "forbidden",
+                "仅超级管理员可以修改核心配置",
+            )),
+        )
+            .into_response();
+    }
+    match state.core_config.update(&user, payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -133,9 +188,10 @@ pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl In
 /// 设置负载均衡模式
 pub async fn set_load_balancing_mode(
     State(state): State<AdminState>,
+    Extension(user): Extension<AuthUser>,
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_load_balancing_mode(payload) {
+    match state.service.set_load_balancing_mode(&user, payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

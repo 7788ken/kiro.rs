@@ -27,6 +27,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -44,6 +45,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setProfileArn('')
     setPriority('0')
     setMachineId('')
     setProxyUrl('')
@@ -78,6 +80,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     mutate(
       {
         authMethod,
+        profileArn: isApiKey ? undefined : profileArn.trim() || undefined,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
@@ -196,6 +199,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* IdC/Builder-ID/IAM 额外字段 */}
             {authMethod === 'idc' && (
               <>
+                <div className="space-y-2">
+                  <label htmlFor="profileArn" className="text-sm font-medium">Profile ARN</label>
+                  <Input id="profileArn" value={profileArn} onChange={e => setProfileArn(e.target.value)} placeholder="arn:aws:codewhisperer:...（企业 IdC 建议填写）" disabled={isPending} />
+                  <p className="text-xs text-muted-foreground">用于企业账号的额度查询和 API 调用；缺少时可能导致额度查询失败。</p>
+                </div>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">
                     Client ID <span className="text-red-500">*</span>

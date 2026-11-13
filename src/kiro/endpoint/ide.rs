@@ -129,6 +129,56 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn request_headers_follow_the_configuration_snapshot() {
+        use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint, RequestContext};
+        use crate::model::config::Config;
+
+        let endpoint = IdeEndpoint::new();
+        let credentials = crate::kiro::model::credentials::KiroCredentials::default();
+        let config = Config::default();
+        let context = RequestContext {
+            credentials: &credentials,
+            token: "local-test-token",
+            machine_id: "local-machine",
+            config: &config,
+        };
+        let before = endpoint
+            .decorate_api(reqwest::Client::new().post("https://localhost"), &context)
+            .build()
+            .unwrap();
+        let mut next = Config::default();
+        next.kiro_version = "next-version".into();
+        next.region = "eu-west-1".into();
+        let context = RequestContext {
+            credentials: &credentials,
+            token: "local-test-token",
+            machine_id: "local-machine",
+            config: &next,
+        };
+        let after = endpoint
+            .decorate_api(reqwest::Client::new().post("https://localhost"), &context)
+            .build()
+            .unwrap();
+        assert_ne!(
+            before.headers().get("user-agent").unwrap(),
+            after.headers().get("user-agent").unwrap()
+        );
+        assert!(
+            after
+                .headers()
+                .get("user-agent")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("next-version")
+        );
+        assert_eq!(
+            after.headers().get("host").unwrap(),
+            "q.eu-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());

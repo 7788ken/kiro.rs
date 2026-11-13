@@ -20,6 +20,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 当前管理员不能管理该凭据或配置
+    Forbidden(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -30,6 +33,7 @@ impl fmt::Display for AdminServiceError {
             }
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
+            AdminServiceError::Forbidden(msg) => write!(f, "{}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
         }
     }
@@ -45,6 +49,7 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
         }
     }
 
@@ -58,6 +63,9 @@ impl AdminServiceError {
             }
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::Forbidden(_) => {
+                AdminErrorResponse::new("forbidden", self.to_string())
             }
         }
     }
