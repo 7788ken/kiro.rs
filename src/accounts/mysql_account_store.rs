@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::models::{
     AccountOverview, AuthUser, BillingConfig, CreditChangeView, MICRO_CREDITS, RequestLog,
-    Reservation, Role, TransactionView, UserView,
+    Reservation, Role, TransactionView, UserView, credential_charge_micro, settlement_notes,
 };
 use super::mysql_store::{MySqlStore, Params, mysql_error};
 
@@ -359,32 +359,28 @@ impl AccountStore {
     }
 
     pub fn get_billing_config(&self) -> Result<BillingConfig, AccountError> {
-        let (input_per_million, output_per_million) = self
+        let (input_per_million, output_per_million, consumption_ratio) = self
             .db
             .first(
-                "SELECT input_per_million, output_per_million FROM billing_config WHERE id = 1",
+                "SELECT input_per_million, output_per_million, consumption_ratio FROM billing_config WHERE id = 1",
                 vec![],
             )?
             .ok_or_else(|| AccountError::Internal("计费配置不存在".into()))?;
         Ok(BillingConfig {
             input_per_million,
             output_per_million,
+            consumption_ratio,
         })
     }
 
     pub fn set_billing_config(&self, config: &BillingConfig) -> Result<(), AccountError> {
-        for price in [config.input_per_million, config.output_per_million] {
-            if !price.is_finite() || !(0.0..=1_000_000_000.0).contains(&price) {
-                return Err(AccountError::InvalidInput(
-                    "单价必须在 0 至 1,000,000,000 积分/百万 token 之间".into(),
-                ));
-            }
-        }
+        config.validate().map_err(AccountError::InvalidInput)?;
         self.db.execute(
-            "UPDATE billing_config SET input_per_million = ?, output_per_million = ? WHERE id = 1",
+            "UPDATE billing_config SET input_per_million = ?, output_per_million = ?, consumption_ratio = ? WHERE id = 1",
             vec![
                 config.input_per_million.into(),
                 config.output_per_million.into(),
+                config.consumption_ratio.into(),
             ],
         )?;
         Ok(())
@@ -441,7 +437,7 @@ impl AccountStore {
         } else {
             Some(actor.id)
         };
-        let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model, t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at, t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro, COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms FROM credit_transactions t JOIN users u ON u.id = t.user_id LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release') WHERE t.kind IN ('reserve', 'charge', 'error') ";
+        let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model, t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at, t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro, COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms FROM credit_transactions t JOIN users u ON u.id = t.user_id LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge') WHERE t.kind IN ('reserve', 'charge', 'error') ";
         let rows: Vec<mysql::Row> = if let Some(id) = user_id {
             self.db.map(
                 &format!("{sql} AND t.user_id = ? ORDER BY t.created_at DESC, t.id DESC LIMIT ?"),
@@ -563,17 +559,18 @@ impl AccountStore {
             return Err(AccountError::InvalidInput("max_tokens 必须为正数".into()));
         }
         let billing = self.get_billing_config()?;
-        let amount = billing.cost_micro(estimated_input, output_limit);
+        let amount = billing.hold_micro(estimated_input, output_limit);
         let id = format!("req_{}", Uuid::new_v4().simple());
         self.db.transaction(|tx| {
             tx.exec_drop("UPDATE users SET balance_micro = balance_micro - ? WHERE id = ? AND enabled = 1 AND balance_micro >= ?", (amount, user.id, amount)).map_err(mysql_error)?;
             if tx.affected_rows() == 0 { let balance = tx.exec_first("SELECT balance_micro FROM users WHERE id = ?", (user.id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?; return Err(AccountError::InsufficientCredits { required_micro: amount, balance_micro: balance }); }
             let balance: i64 = tx.exec_first("SELECT balance_micro FROM users WHERE id = ?", (user.id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?;
-            tx.exec_drop("INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at, request_id, balance_before_micro, reserved_balance_micro) VALUES (?, ?, 'reserve', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)", vec![
+            tx.exec_drop("INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at, request_id, balance_before_micro, reserved_balance_micro, consumption_ratio) VALUES (?, ?, 'reserve', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)", vec![
                 mysql::Value::from(id.clone()), mysql::Value::from(user.id), mysql::Value::from(-amount), mysql::Value::from(balance),
                 mysql::Value::from(model), mysql::Value::from(estimated_input), mysql::Value::from(output_limit), mysql::Value::from(amount),
                 mysql::Value::from(billing.input_per_million), mysql::Value::from(billing.output_per_million), mysql::Value::from(now()),
                 mysql::Value::from(id.clone()), mysql::Value::from(balance + amount), mysql::Value::from(balance),
+                mysql::Value::from(billing.consumption_ratio),
             ]).map_err(mysql_error)?;
             Ok(Some(Reservation { id, user_id: user.id, amount_micro: amount, input_tokens: estimated_input }))
         })
@@ -585,33 +582,40 @@ impl AccountStore {
         success: bool,
         input_tokens: i64,
         output_tokens: i64,
+        credential_credits: Option<f64>,
         log: Option<&RequestLog>,
     ) -> Result<(), AccountError> {
         self.db.transaction(|tx| {
             tx.exec_drop("UPDATE credit_transactions SET status = 'processing' WHERE id = ? AND status = 'pending'", (&reservation.id,)).map_err(mysql_error)?;
             if tx.affected_rows() == 0 { return Ok(()); }
-            let (input_rate, output_rate): (f64, f64) = tx.exec_first("SELECT input_rate, output_rate FROM credit_transactions WHERE id = ?", (&reservation.id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?;
-            let actual = if success { BillingConfig { input_per_million: input_rate, output_per_million: output_rate }.cost_micro(input_tokens, output_tokens).min(reservation.amount_micro) } else { 0 };
-            let refund = reservation.amount_micro - actual;
-            if refund > 0 { tx.exec_drop("UPDATE users SET balance_micro = balance_micro + ? WHERE id = ?", (refund, reservation.user_id)).map_err(mysql_error)?; }
+            let ratio: f64 = tx.exec_first("SELECT COALESCE(consumption_ratio, 1.0) FROM credit_transactions WHERE id = ?", (&reservation.id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?;
+            let reported = credential_charge_micro(credential_credits, ratio);
+            let balance_start: i64 = tx.exec_first("SELECT balance_micro FROM users WHERE id = ?", (reservation.user_id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?;
+            tx.exec_drop("UPDATE users SET balance_micro = GREATEST(0, balance_micro + ? - ?) WHERE id = ?", (reservation.amount_micro, reported, reservation.user_id)).map_err(mysql_error)?;
             let balance: i64 = tx.exec_first("SELECT balance_micro FROM users WHERE id = ?", (reservation.user_id,)).map_err(mysql_error)?.ok_or(AccountError::NotFound)?;
+            let movement = balance - balance_start;
+            let actual = reservation.amount_micro - movement;
+            if reported > actual {
+                tracing::warn!(user_id = reservation.user_id, reported, actual, "凭证消耗超过用户可用余额，已扣至 0");
+            }
+            let (charge_note, adjustment_kind, adjustment_note) = settlement_notes(success, credential_credits, reported, actual, movement, ratio);
             let reserved_balance_micro: Option<i64> = tx.exec_first("SELECT reserved_balance_micro FROM credit_transactions WHERE id = ?", (&reservation.id,)).map_err(mysql_error)?;
             let balance_before_micro = reserved_balance_micro.map(|b| b + reservation.amount_micro);
-            tx.exec_drop("UPDATE credit_transactions SET kind = 'charge', amount_micro = ?, balance_after_micro = ?, input_tokens = ?, output_tokens = ?, status = 'settled', completed_at = ?, request_id = ?, path = COALESCE(?, path), model = COALESCE(?, model), stream = COALESCE(?, stream), balance_before_micro = COALESCE(?, balance_before_micro), reserved_balance_micro = COALESCE(?, reserved_balance_micro), http_status = ?, error_message = ?, duration_ms = ?, first_token_ms = ? WHERE id = ?", vec![
+            tx.exec_drop("UPDATE credit_transactions SET kind = 'charge', amount_micro = ?, balance_after_micro = ?, input_tokens = ?, output_tokens = ?, status = 'settled', completed_at = ?, request_id = ?, path = COALESCE(?, path), model = COALESCE(?, model), stream = COALESCE(?, stream), balance_before_micro = COALESCE(?, balance_before_micro), reserved_balance_micro = COALESCE(?, reserved_balance_micro), http_status = ?, error_message = ?, duration_ms = ?, first_token_ms = ?, note = ? WHERE id = ?", vec![
                 mysql::Value::from(-actual), mysql::Value::from(balance), mysql::Value::from(input_tokens), mysql::Value::from(output_tokens),
                 mysql::Value::from(now()), mysql::Value::from(reservation.id.clone()),
                 mysql::Value::from(log.map(|l| l.path.as_str())), mysql::Value::from(log.map(|l| l.model.as_str())),
                 mysql::Value::from(log.map(|l| l.stream as i64)), mysql::Value::from(balance_before_micro), mysql::Value::from(reserved_balance_micro),
                 mysql::Value::from(log.map(|l| l.http_status)), mysql::Value::from(log.and_then(|l| l.error_message.as_deref())),
-                mysql::Value::from(log.map(|l| l.duration_ms)), mysql::Value::from(log.and_then(|l| l.first_token_ms)), mysql::Value::from(reservation.id.clone()),
+                mysql::Value::from(log.map(|l| l.duration_ms)), mysql::Value::from(log.and_then(|l| l.first_token_ms)), mysql::Value::from(charge_note), mysql::Value::from(reservation.id.clone()),
             ]).map_err(mysql_error)?;
-            tx.exec_drop("INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at, request_id) VALUES (?, ?, NULL, ?, ?, ?, 'settled', ?, ?, ?, ?)", (Uuid::new_v4().to_string(), reservation.user_id, if success { "refund" } else { "release" }, refund, balance, Some(if success { "预授权未使用部分返还" } else { "请求失败，预授权全额返还" }), now(), now(), &reservation.id)).map_err(mysql_error)?;
+            tx.exec_drop("INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at, request_id) VALUES (?, ?, NULL, ?, ?, ?, 'settled', ?, ?, ?, ?)", (Uuid::new_v4().to_string(), reservation.user_id, adjustment_kind, movement, balance, Some(adjustment_note), now(), now(), &reservation.id)).map_err(mysql_error)?;
             Ok(())
         })
     }
 
     pub fn refund(&self, reservation: &Reservation, log: Option<&RequestLog>) {
-        if let Err(error) = self.settle(reservation, false, 0, 0, log) {
+        if let Err(error) = self.settle(reservation, false, 0, 0, None, log) {
             tracing::error!(reservation = %reservation.id, "释放预授权积分失败: {}", error);
         }
     }

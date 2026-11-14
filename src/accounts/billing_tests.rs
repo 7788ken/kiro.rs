@@ -96,7 +96,7 @@ fn transactions(state: &AccountState, key: &str) -> Vec<super::models::Transacti
 #[tokio::test]
 async fn charges_actual_usage_from_json_response() {
     let (state, key, id) = user_fixture();
-    let response = Json(json!({"usage":{"input_tokens":100,"output_tokens":100}})).into_response();
+    let response = Json(json!({"usage":{"input_tokens":100,"output_tokens":100,"credential_credits":0.25}})).into_response();
     let response = app(state.clone(), response)
         .oneshot(request(&key, message()))
         .await
@@ -112,16 +112,20 @@ async fn charges_actual_usage_from_json_response() {
     assert!(String::from_utf8_lossy(&bytes).contains("input_tokens"));
     assert_eq!(
         state.store.get_user_view(id).unwrap().balance_micro,
-        994_000
+        750_000
     );
     let transactions = transactions(&state, &key);
     assert_eq!(transactions.len(), 1);
     let log = &transactions[0];
     assert_eq!(log.kind, "charge");
-    assert_eq!(log.amount_micro, -6000);
+    assert_eq!(log.amount_micro, -250_000);
     assert_eq!(log.balance_before_micro, Some(1_000_000));
-    assert_eq!(log.balance_after_micro, 994_000);
-    assert_eq!(log.refund_micro, 44_010);
+    assert_eq!(log.balance_after_micro, 750_000);
+    assert_eq!(log.refund_micro, -199_990);
+    assert_eq!(
+        log.note.as_deref(),
+        Some("按凭证实际消耗 0.250000 积分结算")
+    );
     assert_eq!(log.reserved_micro, 50_010);
     assert_eq!(log.http_status, Some(200));
     assert!(log.duration_ms.is_some());
@@ -134,7 +138,7 @@ async fn charges_actual_usage_from_sse_response() {
     let (state, key, id) = user_fixture();
     let response = Response::builder()
         .header("content-type", "text/event-stream")
-        .body(Body::from("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":100,\"output_tokens\":100}}\n\n"))
+        .body(Body::from("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":100,\"output_tokens\":100,\"credential_credits\":0.25}}\n\n"))
         .unwrap();
     let response = app(state.clone(), response)
         .oneshot(request(&key, json!({"model":"claude-sonnet-4-6","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hello"}]})))
@@ -147,7 +151,7 @@ async fn charges_actual_usage_from_sse_response() {
     }
     assert_eq!(
         state.store.get_user_view(id).unwrap().balance_micro,
-        994_000
+        750_000
     );
     let logs = transactions(&state, &key);
     assert_eq!(logs.len(), 1);
@@ -185,6 +189,45 @@ async fn refunds_failed_upstream_request_and_preserves_error() {
     assert_eq!(logs[0].reserved_micro, 50_010);
     assert_eq!(logs[0].refund_micro, logs[0].reserved_micro);
     assert_eq!(logs[0].balance_after_micro, 1_000_000);
+}
+
+#[tokio::test]
+async fn successful_response_without_credential_usage_is_free() {
+    let (state, key, id) = user_fixture();
+    let response = Json(json!({"usage":{"input_tokens":100,"output_tokens":100}})).into_response();
+    let response = app(state.clone(), response)
+        .oneshot(request(&key, message()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(
+        state.store.get_user_view(id).unwrap().balance_micro,
+        1_000_000
+    );
+    let log = &transactions(&state, &key)[0];
+    assert_eq!(log.amount_micro, 0);
+    assert_eq!(log.refund_micro, log.reserved_micro);
+    assert_eq!(
+        log.note.as_deref(),
+        Some("上游未返回凭证消耗，本次不扣积分")
+    );
+}
+
+#[tokio::test]
+async fn credential_usage_above_balance_drains_to_zero() {
+    let (state, key, id) = user_fixture();
+    let response = Json(json!({"usage":{"credential_credits":3.0}})).into_response();
+    let response = app(state.clone(), response)
+        .oneshot(request(&key, message()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(state.store.get_user_view(id).unwrap().balance_micro, 0);
+    let log = &transactions(&state, &key)[0];
+    assert_eq!(log.amount_micro, -1_000_000);
+    assert!(log.note.as_deref().unwrap().contains("可用余额不足"));
 }
 
 #[tokio::test]

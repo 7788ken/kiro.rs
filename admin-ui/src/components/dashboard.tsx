@@ -537,7 +537,7 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
 
   return (
     <div className="space-y-7">
-      <PageSection title="凭据列表" description="管理上游 Kiro 凭据。剩余额度属于上游订阅，不等于用户积分，也不随用户扣费同步扣减。" actions={<><Button variant="outline" size="sm" onClick={handleToggleLoadBalancing} disabled={!isSuperAdmin || isLoadingMode || isSettingMode} title={!isSuperAdmin ? '仅超级管理员可修改负载均衡模式' : undefined}><RotateCcw />{loadBalancingMode === 'priority' ? '优先级模式' : '均衡负载'}</Button><Button variant="ghost" size="icon" title="刷新凭据列表" aria-label="刷新凭据列表" onClick={handleRefresh}><RefreshCw /></Button></>}>
+      <PageSection title="凭据列表" description="管理上游 Kiro 凭据。用户单次扣费按该次请求的凭证消耗入账。本页是订阅周期累计，还包含管理员调用和其他客户端。" actions={<><Button variant="outline" size="sm" onClick={handleToggleLoadBalancing} disabled={!isSuperAdmin || isLoadingMode || isSettingMode} title={!isSuperAdmin ? '仅超级管理员可修改负载均衡模式' : undefined}><RotateCcw />{loadBalancingMode === 'priority' ? '优先级模式' : '均衡负载'}</Button><Button variant="ghost" size="icon" title="刷新凭据列表" aria-label="刷新凭据列表" onClick={handleRefresh}><RefreshCw /></Button></>}>
         <div className="flex flex-col gap-3 rounded-xl bg-muted/35 p-3 lg:flex-row lg:items-center">
           <div className="relative min-w-0 flex-1"><Search className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-muted-foreground" /><Input aria-label="搜索凭据" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索邮箱、ID、端点或登记人" className="pl-9" /></div>
           <div className="grid grid-cols-2 gap-2 sm:flex">

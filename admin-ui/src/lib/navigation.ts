@@ -7,10 +7,10 @@ export type AdminSection = typeof adminSections[number]
 export const sectionMeta: Record<AdminSection, { title: string; description: string }> = {
   monitor: { title: '运行概览', description: '查看实时请求速率、当前并发、最近调用及上游凭据池状态。' },
   credentials: { title: '上游凭据', description: '搜索、筛选和管理本人及下级代理登记的凭证。' },
-  usage: { title: '用量统计', description: '按日期、用户、模型和状态聚合 Token、积分消耗与请求趋势。' },
+  usage: { title: '用量统计', description: '按日期、用户、模型和状态聚合 Token，以及锚定到凭证真实消耗的积分。' },
   users: { title: '用户与额度', description: '创建下级代理或普通用户，管理自己分支内的账户与积分。' },
   overview: { title: '我的账户', description: '查看账户余额、Token 用量与当前计费标准。' },
-  transactions: { title: '积分流水', description: '查看每次调用的消费与错误状态，追踪首字、Token、预扣、返还及余额。' },
+  transactions: { title: '积分流水', description: '查看每次调用的凭证消耗、错误状态、首字、Token、预扣、补扣及余额。' },
   settings: { title: '安全与设置', description: '管理登录密码、API Key 与平台计费规则。' },
 }
 

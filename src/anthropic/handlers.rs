@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 
+use crate::accounts::models::CredentialUsage;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -10,7 +11,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -306,6 +307,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(usage): Extension<CredentialUsage>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -419,6 +421,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            usage,
         )
         .await
     } else {
@@ -434,6 +437,7 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            usage,
         )
         .await
     }
@@ -447,6 +451,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: CredentialUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -457,6 +462,7 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_credential_usage(usage);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -584,6 +590,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: CredentialUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -686,6 +693,18 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metering(metering) => {
+                            if let Some(credits) = metering.credit_usage() {
+                                usage.record(credits);
+                                tracing::debug!(credits, "收到凭证实际消耗");
+                            } else if metering.usage.is_some() {
+                                tracing::warn!(
+                                    unit = ?metering.unit,
+                                    usage = ?metering.usage,
+                                    "凭证消耗无法换算为积分，本次不按该事件扣费"
+                                );
+                            }
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -699,6 +718,9 @@ async fn handle_non_stream_request(
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+    if usage.get().is_none() {
+        tracing::warn!(model, "非流式响应没有凭证消耗，本次按 0 积分结算");
     }
 
     // 确定 stop_reason
@@ -832,6 +854,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(usage): Extension<CredentialUsage>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -946,6 +969,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            usage,
         )
         .await
     } else {
@@ -961,6 +985,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            usage,
         )
         .await
     }
@@ -977,6 +1002,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: CredentialUsage,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -985,12 +1011,13 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
     );
+    ctx.set_credential_usage(usage);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

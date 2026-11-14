@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::models::{
     AccountOverview, AuthUser, BillingConfig, CreditChangeView, MICRO_CREDITS, RequestLog,
-    Reservation, Role, TransactionView, UserView,
+    Reservation, Role, TransactionView, UserView, credential_charge_micro, settlement_notes,
 };
 
 #[derive(Debug)]
@@ -68,7 +68,8 @@ impl AccountStore {
             CREATE TABLE IF NOT EXISTS billing_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 input_per_million REAL NOT NULL,
-                output_per_million REAL NOT NULL
+                output_per_million REAL NOT NULL,
+                consumption_ratio REAL NOT NULL DEFAULT 1.0
             );
             CREATE TABLE IF NOT EXISTS credit_transactions (
                 id TEXT PRIMARY KEY,
@@ -95,7 +96,8 @@ impl AccountStore {
                 http_status INTEGER,
                 error_message TEXT,
                 duration_ms INTEGER,
-                first_token_ms INTEGER
+                first_token_ms INTEGER,
+                consumption_ratio REAL NOT NULL DEFAULT 1.0
             );
             CREATE INDEX IF NOT EXISTS idx_transactions_user ON credit_transactions(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_transactions_pending ON credit_transactions(status) WHERE status = 'pending';
@@ -128,6 +130,18 @@ impl AccountStore {
         ] {
             ensure_column(&connection, "credit_transactions", column, definition)?;
         }
+        ensure_column(
+            &connection,
+            "billing_config",
+            "consumption_ratio",
+            "REAL NOT NULL DEFAULT 1.0",
+        )?;
+        ensure_column(
+            &connection,
+            "credit_transactions",
+            "consumption_ratio",
+            "REAL NOT NULL DEFAULT 1.0",
+        )?;
         connection.execute_batch(
             "UPDATE credit_transactions SET reserved_micro = -reserved_micro WHERE reserved_micro < 0;
              UPDATE credit_transactions SET error_message = '历史失败记录：旧版日志未保存具体错误信息' WHERE kind = 'charge' AND status = 'settled' AND amount_micro = 0 AND error_message IS NULL;
@@ -135,7 +149,7 @@ impl AccountStore {
              CREATE INDEX IF NOT EXISTS idx_transactions_request ON credit_transactions(request_id, created_at ASC);",
         )?;
         connection.execute(
-            "INSERT OR IGNORE INTO billing_config VALUES (1, 10.0, 50.0)",
+            "INSERT OR IGNORE INTO billing_config (id, input_per_million, output_per_million) VALUES (1, 10.0, 50.0)",
             [],
         )?;
         drop(connection);
@@ -516,27 +530,27 @@ impl AccountStore {
     pub fn get_billing_config(&self) -> Result<BillingConfig, AccountError> {
         let connection = self.connection.lock();
         Ok(connection.query_row(
-            "SELECT input_per_million, output_per_million FROM billing_config WHERE id = 1",
+            "SELECT input_per_million, output_per_million, consumption_ratio FROM billing_config WHERE id = 1",
             [],
             |row| {
                 Ok(BillingConfig {
                     input_per_million: row.get(0)?,
                     output_per_million: row.get(1)?,
+                    consumption_ratio: row.get(2)?,
                 })
             },
         )?)
     }
 
     pub fn set_billing_config(&self, config: &BillingConfig) -> Result<(), AccountError> {
-        for price in [config.input_per_million, config.output_per_million] {
-            if !price.is_finite() || !(0.0..=1_000_000_000.0).contains(&price) {
-                return Err(AccountError::InvalidInput(
-                    "单价必须在 0 至 1,000,000,000 积分/百万 token 之间".into(),
-                ));
-            }
-        }
+        config
+            .validate()
+            .map_err(AccountError::InvalidInput)?;
         let connection = self.connection.lock();
-        connection.execute("UPDATE billing_config SET input_per_million = ?1, output_per_million = ?2 WHERE id = 1", params![config.input_per_million, config.output_per_million])?;
+        connection.execute(
+            "UPDATE billing_config SET input_per_million = ?1, output_per_million = ?2, consumption_ratio = ?3 WHERE id = 1",
+            params![config.input_per_million, config.output_per_million, config.consumption_ratio],
+        )?;
         Ok(())
     }
 
@@ -603,7 +617,7 @@ impl AccountStore {
                    t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro,
                    COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms
                    FROM credit_transactions t JOIN users u ON u.id = t.user_id
-                   LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release')
+                   LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge')
                    WHERE t.kind IN ('reserve', 'charge', 'error') ";
         let order = " ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?1";
         let mut rows = Vec::new();
@@ -720,7 +734,7 @@ impl AccountStore {
             return Err(AccountError::InvalidInput("max_tokens 必须为正数".into()));
         }
         let billing = self.get_billing_config()?;
-        let amount = billing.cost_micro(estimated_input, output_limit);
+        let amount = billing.hold_micro(estimated_input, output_limit);
         let id = format!("req_{}", Uuid::new_v4().simple());
         let connection = self.connection.lock();
         let transaction = connection.unchecked_transaction()?;
@@ -749,9 +763,9 @@ impl AccountStore {
         )?;
         let balance_before = balance + amount;
         transaction.execute(
-            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at, request_id, balance_before_micro, reserved_balance_micro)
-             VALUES (?1, ?2, 'reserve', ?3, ?4, ?5, ?6, ?7, ?12, ?9, ?10, 'pending', ?8, ?1, ?11, ?4)",
-            params![id, user.id, -amount, balance, model, estimated_input, output_limit, now(), billing.input_per_million, billing.output_per_million, balance_before, amount],
+            "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, model, input_tokens, output_tokens, reserved_micro, input_rate, output_rate, status, created_at, request_id, balance_before_micro, reserved_balance_micro, consumption_ratio)
+             VALUES (?1, ?2, 'reserve', ?3, ?4, ?5, ?6, ?7, ?12, ?9, ?10, 'pending', ?8, ?1, ?11, ?4, ?13)",
+            params![id, user.id, -amount, balance, model, estimated_input, output_limit, now(), billing.input_per_million, billing.output_per_million, balance_before, amount, billing.consumption_ratio],
         )?;
         transaction.commit()?;
         Ok(Some(Reservation {
@@ -768,6 +782,7 @@ impl AccountStore {
         success: bool,
         input_tokens: i64,
         output_tokens: i64,
+        credential_credits: Option<f64>,
         log: Option<&RequestLog>,
     ) -> Result<(), AccountError> {
         let connection = self.connection.lock();
@@ -776,35 +791,46 @@ impl AccountStore {
         if changed == 0 {
             return Ok(());
         }
-        let billing: BillingConfig = transaction.query_row(
-            "SELECT input_rate, output_rate FROM credit_transactions WHERE id = ?1",
+        let ratio: f64 = transaction.query_row(
+            "SELECT COALESCE(consumption_ratio, 1.0) FROM credit_transactions WHERE id = ?1",
             [&reservation.id],
-            |row| {
-                Ok(BillingConfig {
-                    input_per_million: row.get(0)?,
-                    output_per_million: row.get(1)?,
-                })
-            },
+            |row| row.get(0),
         )?;
-        let actual = if success {
-            billing
-                .cost_micro(input_tokens, output_tokens)
-                .min(reservation.amount_micro)
-        } else {
-            0
-        };
-        let refund = reservation.amount_micro - actual;
-        if refund > 0 {
-            transaction.execute(
-                "UPDATE users SET balance_micro = balance_micro + ?1 WHERE id = ?2",
-                params![refund, reservation.user_id],
-            )?;
-        }
-        let balance = transaction.query_row(
+        let reported = credential_charge_micro(credential_credits, ratio);
+        let balance_start: i64 = transaction.query_row(
             "SELECT balance_micro FROM users WHERE id = ?1",
             [reservation.user_id],
             |row| row.get(0),
         )?;
+        // 预扣已经从余额划出。这里改成扣掉「凭证消耗 × 锁定倍率」，
+        // 并且不允许降到 0 以下。
+        transaction.execute(
+            "UPDATE users SET balance_micro = MAX(0, balance_micro + ?1 - ?2) WHERE id = ?3",
+            params![reservation.amount_micro, reported, reservation.user_id],
+        )?;
+        let balance: i64 = transaction.query_row(
+            "SELECT balance_micro FROM users WHERE id = ?1",
+            [reservation.user_id],
+            |row| row.get(0),
+        )?;
+        let movement = balance - balance_start;
+        let actual = reservation.amount_micro - movement;
+        if reported > actual {
+            tracing::warn!(
+                user_id = reservation.user_id,
+                reported,
+                actual,
+                "凭证消耗超过用户可用余额，已扣至 0"
+            );
+        }
+        let (charge_note, adjustment_kind, adjustment_note) = settlement_notes(
+            success,
+            credential_credits,
+            reported,
+            actual,
+            movement,
+            ratio,
+        );
         let reserved_balance_micro: Option<i64> = transaction.query_row(
             "SELECT reserved_balance_micro FROM credit_transactions WHERE id = ?1",
             [&reservation.id],
@@ -813,22 +839,18 @@ impl AccountStore {
         let balance_before_micro = reserved_balance_micro
             .map(|balance_after_reservation| balance_after_reservation + reservation.amount_micro);
         transaction.execute(
-            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15 WHERE id = ?16",
-            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), reservation.id],
+            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15, note = ?16 WHERE id = ?17",
+            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), charge_note, reservation.id],
         )?;
         insert_transaction(
             &transaction,
             reservation.user_id,
             None,
-            if success { "refund" } else { "release" },
-            refund,
+            adjustment_kind,
+            movement,
             balance,
             "settled",
-            Some(if success {
-                "预授权未使用部分返还"
-            } else {
-                "请求失败，预授权全额返还"
-            }),
+            Some(&adjustment_note),
             Some(&reservation.id),
         )?;
         transaction.commit()?;
@@ -836,7 +858,7 @@ impl AccountStore {
     }
 
     pub fn refund(&self, reservation: &Reservation, log: Option<&RequestLog>) {
-        if let Err(error) = self.settle(reservation, false, 0, 0, log) {
+        if let Err(error) = self.settle(reservation, false, 0, 0, None, log) {
             tracing::error!(reservation = %reservation.id, "释放预授权积分失败: {}", error);
         }
     }
@@ -1224,12 +1246,16 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_940_000
         );
-        store.settle(&reservation, true, 100, 100, None).unwrap();
+        store
+            .settle(&reservation, true, 100, 100, Some(0.006), None)
+            .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
         );
-        store.settle(&reservation, true, 1000, 1000, None).unwrap();
+        store
+            .settle(&reservation, true, 1000, 1000, Some(9.0), None)
+            .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
@@ -1242,6 +1268,99 @@ mod tests {
         assert_eq!(transactions[0].reserved_balance_micro, Some(9_940_000));
         assert_eq!(transactions[0].refund_micro, 54_000);
         assert_eq!(transactions[0].balance_after_micro, 9_994_000);
+        assert_eq!(
+            transactions[0].note.as_deref(),
+            Some("按凭证实际消耗 0.006000 积分结算")
+        );
+    }
+
+    #[test]
+    fn settlement_follows_credential_credits_and_stops_at_zero() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 1.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        assert_eq!(reservation.amount_micro, 60_000);
+        store
+            .settle(&reservation, true, 100, 100, None, None)
+            .unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            MICRO_CREDITS
+        );
+        assert_eq!(
+            store.list_transactions(&user, None, 10).unwrap()[0].amount_micro,
+            0
+        );
+
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        store
+            .settle(&reservation, true, 1, 1, Some(0.25), None)
+            .unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            750_000
+        );
+        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(charged.amount_micro, -250_000);
+        assert_eq!(charged.refund_micro, -190_000);
+
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        store
+            .settle(&reservation, true, 1, 1, Some(5.0), None)
+            .unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            0
+        );
+        let drained = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(drained.amount_micro, -750_000);
+        assert!(
+            drained
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("可用余额不足")
+        );
+    }
+
+    #[test]
+    fn consumption_ratio_marks_up_the_credential_charge() {
+        let store = store();
+        let manager = manager(&store);
+        let mut billing = store.get_billing_config().unwrap();
+        billing.consumption_ratio = 1.2;
+        store.set_billing_config(&billing).unwrap();
+        assert!(store
+            .set_billing_config(&BillingConfig {
+                consumption_ratio: 0.0,
+                ..billing.clone()
+            })
+            .is_err());
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 10.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        assert_eq!(reservation.amount_micro, 72_000);
+        billing.consumption_ratio = 9.0;
+        store.set_billing_config(&billing).unwrap();
+        store
+            .settle(&reservation, true, 1, 1, Some(1.0), None)
+            .unwrap();
+        assert_eq!(
+            store.authenticate_key(&key).unwrap().unwrap().balance_micro,
+            8_800_000
+        );
+        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(charged.amount_micro, -1_200_000);
+        assert_eq!(
+            charged.note.as_deref(),
+            Some("凭证消耗 1.000000，按 1.2 倍率收取 1.200000 积分")
+        );
     }
 
     #[test]
@@ -1298,7 +1417,9 @@ mod tests {
         ] {
             let user = store.authenticate_key(key).unwrap().unwrap();
             let reservation = store.reserve(&user, model, 1000, 1000).unwrap().unwrap();
-            store.settle(&reservation, true, 100, 100, None).unwrap();
+            store
+                .settle(&reservation, true, 100, 100, Some(0.006), None)
+                .unwrap();
             store
                 .connection
                 .lock()

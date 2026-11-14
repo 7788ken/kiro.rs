@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Coins, TrendingUp, Wallet } from 'lucide-react'
 import { getAccount, getTransactions } from '@/api/accounts'
 import type { AccountOverview } from '@/types/accounts'
-import { Card, CardContent } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { UsersPanel } from '@/components/users-panel'
 import { TransactionsPanel } from '@/components/transactions-panel'
@@ -35,11 +35,14 @@ function Overview({ account, transactionCount, onShowTransactions }: { account: 
     <div className="space-y-7">
       <div className="grid gap-4 md:grid-cols-3">
         <MetricCard label="可用积分" value={formatCredits(account.user.balanceMicro)} detail={`${account.pendingCount} 笔请求正在结算`} icon={Wallet} tone="accent" />
-        <MetricCard label="累计消费" value={formatCredits(account.totalSpentMicro)} detail="按实际 Token 用量结算" icon={Coins} />
+        <MetricCard label="累计消费" value={formatCredits(account.totalSpentMicro)} detail={`按凭证消耗 × ${account.billing.consumptionRatio ?? 1} 倍率结算`} icon={Coins} />
         <MetricCard label="累计 Token" value={(account.totalInputTokens + account.totalOutputTokens).toLocaleString()} detail={`输入 ${account.totalInputTokens.toLocaleString()} · 输出 ${account.totalOutputTokens.toLocaleString()}`} icon={TrendingUp} />
       </div>
-      <PageSection title="计费标准" description="请求开始时锁定价格，完成后按实际用量结算。" actions={<Button variant="outline" size="sm" onClick={onShowTransactions}>查看 {transactionCount} 条调用日志</Button>}>
-        <Card><CardContent className="grid gap-5 p-5 sm:grid-cols-2"><div><p className="text-sm text-muted-foreground">每百万输入 Token</p><p className="mt-2 text-xl font-semibold tabular-nums">{account.billing.inputPerMillion}<span className="ml-2 text-sm font-normal text-muted-foreground">积分</span></p></div><div><p className="text-sm text-muted-foreground">每百万输出 Token</p><p className="mt-2 text-xl font-semibold tabular-nums">{account.billing.outputPerMillion}<span className="ml-2 text-sm font-normal text-muted-foreground">积分</span></p></div></CardContent></Card>
+      <PageSection title="计费与预扣" description="计费单价决定最终扣多少。预扣费只在请求开始时冻结余额。" actions={<Button variant="outline" size="sm" onClick={onShowTransactions}>查看 {transactionCount} 条调用日志</Button>}>
+        <div className="grid gap-5 lg:grid-cols-2">
+          <Card><CardHeader><CardTitle className="text-base">计费单价</CardTitle><CardDescription>最终扣费 = 上游本次消耗 × 消费倍率。</CardDescription></CardHeader><CardContent><p className="text-sm text-muted-foreground">消费倍率</p><p className="mt-2 text-xl font-semibold tabular-nums">{account.billing.consumptionRatio ?? 1}<span className="ml-2 text-sm font-normal text-muted-foreground">倍</span></p></CardContent></Card>
+          <Card><CardHeader><CardTitle className="text-base">预扣费</CardTitle><CardDescription>按 token 估算冻结额，不决定最终扣费。</CardDescription></CardHeader><CardContent className="grid gap-5 sm:grid-cols-2"><div><p className="text-sm text-muted-foreground">每百万输入 Token</p><p className="mt-2 text-xl font-semibold tabular-nums">{account.billing.inputPerMillion}<span className="ml-2 text-sm font-normal text-muted-foreground">积分</span></p></div><div><p className="text-sm text-muted-foreground">每百万输出 Token</p><p className="mt-2 text-xl font-semibold tabular-nums">{account.billing.outputPerMillion}<span className="ml-2 text-sm font-normal text-muted-foreground">积分</span></p></div></CardContent></Card>
+        </div>
       </PageSection>
     </div>
   )

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::accounts::models::CredentialUsage;
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -536,6 +537,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 上游 metering 事件写入这里，供计费中间件按凭证真实消耗结算
+    credential_usage: CredentialUsage,
 }
 
 impl StreamContext {
@@ -562,7 +565,13 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            credential_usage: CredentialUsage::new(),
         }
+    }
+
+    /// 绑定本次请求的凭证消耗收集器。后到的 metering 事件覆盖先前的值。
+    pub fn set_credential_usage(&mut self, usage: CredentialUsage) {
+        self.credential_usage = usage;
     }
 
     /// 生成 message_start 事件
@@ -629,6 +638,23 @@ impl StreamContext {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::Metering(metering) => {
+                match metering.credit_usage() {
+                    Some(credits) => {
+                        self.credential_usage.record(credits);
+                        tracing::debug!(credits, "收到凭证实际消耗");
+                    }
+                    None if metering.usage.is_some() => {
+                        tracing::warn!(
+                            unit = ?metering.unit,
+                            usage = ?metering.usage,
+                            "凭证消耗无法换算为积分，本次不按该事件扣费"
+                        );
+                    }
+                    None => {}
+                }
+                Vec::new()
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -1035,6 +1061,12 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if self.credential_usage.get().is_none() {
+            tracing::warn!(
+                model = %self.model,
+                "流式响应没有凭证消耗，本次按 0 积分结算"
+            );
+        }
         let mut events = Vec::new();
 
         // Flush thinking_buffer 中的剩余内容
@@ -1165,6 +1197,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 绑定本次请求的凭证消耗收集器。
+    pub fn set_credential_usage(&mut self, usage: CredentialUsage) {
+        self.inner.set_credential_usage(usage);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1244,6 +1281,35 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[test]
+    fn metering_event_is_recorded_for_billing() {
+        let usage = CredentialUsage::new();
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            10,
+            false,
+            HashMap::new(),
+        );
+        ctx.set_credential_usage(usage.clone());
+        let event = Event::Metering(crate::kiro::model::events::MeteringEvent {
+            unit: Some("credit".to_string()),
+            unit_plural: Some("credits".to_string()),
+            usage: Some(0.0169543708291874),
+        });
+        assert!(ctx.process_kiro_event(&event).is_empty());
+        let recorded = usage.get().unwrap();
+        assert!((recorded - 0.0169543708291874).abs() < 1e-12);
+        ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                unit: Some("credit".to_string()),
+                unit_plural: None,
+                usage: Some(0.25),
+            },
+        ));
+        assert_eq!(usage.get(), Some(0.25));
+    }
 
     #[test]
     fn test_sse_event_format() {

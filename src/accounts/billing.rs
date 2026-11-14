@@ -17,7 +17,7 @@ use crate::{
     accounts::{
         AccountState, AccountStore,
         middleware::error_response,
-        models::{AuthUser, RequestLog, Reservation},
+        models::{AuthUser, CredentialUsage, RequestLog, Reservation},
         store::AccountError,
     },
     token,
@@ -150,6 +150,9 @@ pub async fn billing_middleware(
             return error_response(error);
         }
     };
+    let credential_usage = CredentialUsage::new();
+    let mut request = Request::from_parts(parts, Body::from(bytes));
+    request.extensions_mut().insert(credential_usage.clone());
     let mut guard = BillingGuard::new(
         state.store.clone(),
         reservation,
@@ -158,10 +161,9 @@ pub async fn billing_middleware(
         stream,
         started_at,
         state.tracker.begin(&user, &path, &model, stream),
+        credential_usage,
     );
-    let response = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
+    let response = next.run(request).await;
     guard.http_status = response.status().as_u16();
     let (response_parts, body) = response.into_parts();
     let is_sse = response_parts
@@ -223,6 +225,8 @@ struct BillingGuard {
     error_message: Option<String>,
     live: Option<crate::admin::TrackedRequestGuard>,
     completed: bool,
+    credential_usage: CredentialUsage,
+    reported_credits: Option<f64>,
 }
 
 impl BillingGuard {
@@ -234,6 +238,7 @@ impl BillingGuard {
         stream: bool,
         started_at: Instant,
         live: crate::admin::TrackedRequestGuard,
+        credential_usage: CredentialUsage,
     ) -> Self {
         Self {
             store,
@@ -250,6 +255,8 @@ impl BillingGuard {
             error_message: None,
             live: Some(live),
             completed: false,
+            credential_usage,
+            reported_credits: None,
         }
     }
 
@@ -329,6 +336,11 @@ impl BillingGuard {
         if let Some(output) = usage.get("output_tokens").and_then(Value::as_i64) {
             self.output_tokens = self.output_tokens.max(output.max(0));
         }
+        if let Some(credits) = usage.get("credential_credits").and_then(Value::as_f64) {
+            if credits.is_finite() && credits >= 0.0 {
+                self.reported_credits = Some(credits);
+            }
+        }
     }
 
     fn record_error(&mut self, message: &str) {
@@ -353,10 +365,20 @@ impl BillingGuard {
             self.buffer.clear();
         }
         if !success && self.error_message.is_none() {
-            let message = if self.stream && self.http_status().is_success() {
-                "客户端中断连接，本次调用未计费，预扣积分已全额返还".to_string()
+            let has_credential_usage = self
+                .credential_usage
+                .get()
+                .or(self.reported_credits)
+                .is_some_and(|credits| credits > 0.0);
+            let message = if has_credential_usage {
+                "连接已中断，已按收到的凭证消耗结算".to_string()
+            } else if self.stream && self.http_status().is_success() {
+                "客户端中断连接，上游未返回凭证消耗，预扣积分已全额返还".to_string()
             } else {
-                format!("请求失败（HTTP {}），本次调用未计费", self.http_status)
+                format!(
+                    "请求失败（HTTP {}），上游未返回凭证消耗，本次未计费",
+                    self.http_status
+                )
             };
             self.record_error(&message);
         }
@@ -384,11 +406,14 @@ impl BillingGuard {
                     self.error_message.clone(),
                 );
             }
+            let billed_success = success && self.error_message.is_none();
+            let credential_credits = self.credential_usage.get().or(self.reported_credits);
             if let Err(error) = self.store.settle(
                 &reservation,
-                success && self.error_message.is_none(),
+                billed_success,
                 input,
                 self.output_tokens,
+                credential_credits,
                 Some(&log),
             ) {
                 tracing::error!(reservation = %reservation.id, "结算积分失败: {}", error);

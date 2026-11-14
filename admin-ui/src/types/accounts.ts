@@ -12,6 +12,7 @@ export interface AuthUser {
 export interface BillingConfig {
   inputPerMillion: number
   outputPerMillion: number
+  consumptionRatio: number
 }
 
 export interface AccountOverview {
