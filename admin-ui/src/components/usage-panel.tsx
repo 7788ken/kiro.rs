@@ -50,7 +50,7 @@ export function UsagePanel({ isManager, currentUserId }: { isManager: boolean; c
     setApplied({ startDate, endDate, groupBy, userId })
   }
   const groupTitle = applied.groupBy === 'user' ? '按用户' : applied.groupBy === 'model' ? '按模型' : applied.groupBy === 'status' ? '按请求状态' : '按日期'
-  return <PageSection title="用量统计" description="按结算时间聚合真实调用流水，Token 与积分消耗不重复计算预扣和返还。" actions={<Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>刷新数据</Button>}>
+  return <PageSection title="用量统计" description="统计本地用户按 Token 计费的积分，不是上游凭据的订阅用量；两者单位和周期不同，不能直接对账。" actions={<Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>刷新数据</Button>}>
     <form onSubmit={submit} className="flex flex-wrap items-end gap-3 rounded-xl bg-muted/35 p-3">
       <div className="space-y-1.5"><label htmlFor="usage-start" className="text-xs font-medium">开始日期</label><Input id="usage-start" type="date" value={startDate} onChange={event => setStartDate(event.target.value)} required /></div>
       <div className="space-y-1.5"><label htmlFor="usage-end" className="text-xs font-medium">结束日期</label><Input id="usage-end" type="date" value={endDate} onChange={event => setEndDate(event.target.value)} required /></div>
@@ -61,7 +61,7 @@ export function UsagePanel({ isManager, currentUserId }: { isManager: boolean; c
     </form>
     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       <MetricCard label="总 Token" value={data?.totalTokens.toLocaleString() ?? '—'} detail={`输入 ${data?.inputTokens.toLocaleString() ?? '—'} · 输出 ${data?.outputTokens.toLocaleString() ?? '—'}`} icon={TrendingUp} tone="accent" />
-      <MetricCard label="实际消耗积分" value={data ? formatCredits(data.spentMicro) : '—'} detail="按结算后的实际消费计算" icon={Coins} />
+      <MetricCard label="用户实际消耗积分" value={data ? formatCredits(data.spentMicro) : '—'} detail="按本地流水结算，不等于上游订阅用量" icon={Coins} />
       <MetricCard label="调用次数" value={data?.totalRequests.toLocaleString() ?? '—'} detail={`成功 ${data?.successfulRequests.toLocaleString() ?? '—'} · 失败 ${data?.failedRequests.toLocaleString() ?? '—'}`} icon={CheckCircle2} tone="success" />
       <MetricCard label="活跃用户" value={data?.activeUsers.toLocaleString() ?? '—'} detail="当前筛选范围内的用户数" icon={UsersRound} />
     </div>
