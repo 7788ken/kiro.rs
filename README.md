@@ -242,7 +242,7 @@ docker-compose up
 |------|------|--------|------|
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `apiKey` | string | - | 自定义 API Key（必配；按超级管理员身份认证，不能调用对话接口，见[认证方式](#认证方式)） |
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
@@ -257,6 +257,7 @@ docker-compose up
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
+| `egressCheckUrl` | string | `https://checkip.amazonaws.com` | 出口代理健康检测地址，GET 后响应体须为纯文本 IP（IPv4/IPv6） |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
@@ -386,7 +387,9 @@ docker-compose up
 
 支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
 
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
+**代理优先级**：`凭据.proxyUrl = "direct"` > `凭据.proxyId`（出口代理池） > `凭据.proxyUrl` > `config.proxyUrl` > 无代理
+
+`proxyId` 指向的代理即使检测不健康也照常使用，不会回退到其他出口，以免更换出口 IP；`proxyId` 指向已删除的条目时记录警告并按未绑定处理。
 
 | 凭据 `proxyUrl` 值 | 行为 |
 |---|---|
@@ -417,6 +420,15 @@ docker-compose up
 ]
 ```
 
+### 出口代理池
+
+管理员可在后台「出口代理」页维护一组代理（持久化到凭据文件同目录的 `proxies.json`，健康状态缓存在 `proxy_health.json`）。每个凭据通过 `proxyId` 固定绑定一个代理，多个凭据可共用同一个代理。
+
+- 添加凭据时未指定 `proxyId` / `proxyUrl`：从**启用且健康**的代理中挑绑定凭据数最少的一个（同数取 ID 小的）；代理池没有启用的代理时沿用全局代理；有启用的代理但都不健康时返回 400。
+- 显式 `proxyUrl`（含 `direct`）不走自动分配。
+- 服务启动后立即检测一次所有启用的代理，之后每 10 分钟检测一次（GET `egressCheckUrl`，记录出口 IP、延迟和错误）。
+- `proxies.json` 中的代理密码与 `credentials.json` 中的 `proxyPassword` 一样为明文存储，接口和日志中不会返回密码。
+
 ### 认证方式
 
 客户端请求本服务时，支持两种认证方式：
@@ -430,6 +442,8 @@ docker-compose up
    ```
    Authorization: Bearer sk-your-api-key
    ```
+
+对话接口（`POST /v1/messages`、`POST /cc/v1/messages`）只接受普通用户账户的 API Key。管理员和超级管理员账户的 Key 调用对话接口会返回 `403 permission_error`（管理员调用不计费，因此不允许用来对话）。`config.json` 中的 `apiKey` 和 `adminApiKey` 都会被识别为超级管理员，同样不能调用对话接口，请在后台创建普通用户并使用其 Key。管理员 Key 仍可调用 `GET /v1/models` 和 `count_tokens`。
 
 ### 环境变量
 
@@ -526,13 +540,24 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
 
 - **Admin API（认证同 API Key）**
-  - `GET /api/admin/credentials` - 获取所有凭据状态
+  - `GET /api/admin/credentials` - 获取凭据状态（默认不含已归档凭据，`?includeArchived=true` 包含）
   - `POST /api/admin/credentials` - 添加新凭据
-  - `DELETE /api/admin/credentials/:id` - 删除凭据
+  - `POST /api/admin/credentials/:id/archive` - 归档凭据，请求体可选 `{"reason": "..."}`；归档后凭据被禁用、不参与调度，统计数据保留
+  - `POST /api/admin/credentials/:id/unarchive` - 恢复已归档凭据；恢复后仍为禁用状态，需手动启用
+  - `DELETE /api/admin/credentials/:id` - 彻底删除凭据，仅超级管理员可用，且仅限已归档凭据（未归档返回 400）；Token、统计、累计消耗和余额缓存一并删除，无法恢复
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `PUT /api/admin/credentials/:id/proxy` - 改绑代理，请求体三选一：`{"proxyId": 1}` 绑定代理池条目 / `{"direct": true}` 直连 / `{"clear": true}` 回退全局代理；改绑会清除凭据上手动填写的代理地址与认证
+  - `POST /api/admin/credentials/:id/check-egress` - 用凭据实际使用的代理检测一次出口 IP（不写入代理池健康状态）
+  - `GET /api/admin/proxies` - 出口代理列表（含健康状态、出口 IP、未归档绑定凭据数；密码只返回 `passwordSet`）
+  - `POST /api/admin/proxies` - 新增代理，请求体 `{"name", "url", "username"?, "password"?, "note"?}`；URL 协议须为 http/https/socks5/socks5h
+  - `PUT /api/admin/proxies/:id` - 更新代理；`password` 留空保留原值，`"clearPassword": true` 清除认证
+  - `DELETE /api/admin/proxies/:id` - 删除代理；仍有未归档凭据绑定时拒绝
+  - `POST /api/admin/proxies/:id/enabled` - 启用或停用代理，请求体 `{"enabled": true}`
+  - `POST /api/admin/proxies/:id/check` - 检测单个代理
+  - `POST /api/admin/proxies/check-all` - 检测全部启用的代理
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

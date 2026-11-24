@@ -10,13 +10,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountStore, AuthUser, Role};
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, ProxyBinding};
+use crate::proxy_pool::{PickError, ProxyInput, ProxyPool, ProxyPoolError};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, ArchiveCredentialRequest, BalanceResponse, CredentialEgressResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse, ProxyItem, ProxyListResponse,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest,
 };
+
+/// 代理池中没有健康代理时添加凭据的错误信息
+const NO_HEALTHY_PROXY_MESSAGE: &str = "代理池中没有健康的代理，请先检查代理或显式指定 direct";
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -35,6 +40,8 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    /// 出口代理池（与 token_manager、provider 共享同一实例）
+    proxy_pool: Arc<ProxyPool>,
     account_store: Arc<AccountStore>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
@@ -55,6 +62,7 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
         Self {
+            proxy_pool: token_manager.proxy_pool(),
             token_manager,
             account_store,
             balance_cache: Mutex::new(balance_cache),
@@ -64,11 +72,16 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
+    ///
+    /// `include_archived` 为 false 时过滤掉已归档凭据。
+    /// `total` 只统计未归档凭据（已归档凭据一定是禁用的，不影响 `available`）。
     pub fn get_all_credentials(
         &self,
         actor: &AuthUser,
+        include_archived: bool,
     ) -> Result<CredentialsStatusResponse, AdminServiceError> {
         let snapshot = self.token_manager.snapshot();
+        let total = snapshot.entries.iter().filter(|e| !e.archived).count();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
         let manageable_owner_ids = self
             .account_store
@@ -78,6 +91,7 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
+            .filter(|entry| include_archived || !entry.archived)
             .map(|entry| CredentialStatusItem {
                 id: entry.id,
                 priority: entry.priority,
@@ -93,8 +107,12 @@ impl AdminService {
                 email: entry.email,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
+                used_credits: entry.used_credits,
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_id: entry.proxy_id,
+                proxy_name: entry.proxy_name,
+                egress_ip: entry.egress_ip,
                 refresh_failure_count: entry.refresh_failure_count,
                 registered_by: entry.registered_by,
                 registered_by_name: entry.registered_by_name.clone(),
@@ -104,6 +122,10 @@ impl AdminService {
                         .is_some_and(|id| manageable_owner_ids.contains(&id)),
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                archived: entry.archived,
+                archived_at: entry.archived_at,
+                archived_by: entry.archived_by,
+                archive_reason: entry.archive_reason,
             })
             .collect();
 
@@ -111,7 +133,7 @@ impl AdminService {
         credentials.sort_by_key(|c| c.priority);
 
         Ok(CredentialsStatusResponse {
-            total: snapshot.total,
+            total,
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
@@ -268,6 +290,42 @@ impl AdminService {
             }
         }
 
+        // 代理：proxyId 与 proxyUrl 互斥；都不传时从健康代理中自动分配
+        let proxy_url = req
+            .proxy_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        let proxy_id = match (req.proxy_id, proxy_url.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(AdminServiceError::InvalidRequest(
+                    "proxyId 与 proxyUrl 不能同时指定".into(),
+                ));
+            }
+            (Some(proxy_id), None) => {
+                self.require_enabled_proxy(proxy_id)?;
+                Some(proxy_id)
+            }
+            // 显式直填代理或 direct：不走自动分配
+            (None, Some(_)) => None,
+            (None, None) => {
+                // 每次调用都基于当前快照重新计数，批量导入逐条调用时自然均衡
+                let bound_counts = self.bound_counts();
+                match self.proxy_pool.pick_for_new_credential(&bound_counts) {
+                    Ok(picked) => picked,
+                    Err(PickError::NoHealthyProxy) => {
+                        return Err(AdminServiceError::InvalidRequest(
+                            NO_HEALTHY_PROXY_MESSAGE.into(),
+                        ));
+                    }
+                }
+            }
+        };
+        let (proxy_username, proxy_password) = if proxy_url.is_some() {
+            (req.proxy_username, req.proxy_password)
+        } else {
+            (None, None)
+        };
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -286,14 +344,19 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            proxy_id,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             registered_by: Some(actor.id),
             registered_by_name: Some(actor.username.clone()),
             endpoint: req.endpoint,
+            archived: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -317,12 +380,194 @@ impl AdminService {
         })
     }
 
-    /// 删除凭据
-    pub fn delete_credential(&self, actor: &AuthUser, id: u64) -> Result<(), AdminServiceError> {
+    // ============ 出口代理池 ============
+
+    /// 未归档凭据按 proxy_id 计数
+    fn bound_counts(&self) -> HashMap<u64, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.token_manager.snapshot().entries {
+            if entry.archived {
+                continue;
+            }
+            if let Some(proxy_id) = entry.proxy_id {
+                *counts.entry(proxy_id).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn require_enabled_proxy(&self, proxy_id: u64) -> Result<(), AdminServiceError> {
+        match self.proxy_pool.get(proxy_id) {
+            Some(entry) if entry.enabled => Ok(()),
+            Some(_) => Err(AdminServiceError::InvalidRequest(format!(
+                "代理 #{} 已停用",
+                proxy_id
+            ))),
+            None => Err(AdminServiceError::InvalidRequest(format!(
+                "代理 #{} 不存在",
+                proxy_id
+            ))),
+        }
+    }
+
+    fn proxy_item(
+        &self,
+        entry: crate::proxy_pool::ProxyEntry,
+        health: crate::proxy_pool::ProxyHealth,
+        bound_counts: &HashMap<u64, usize>,
+    ) -> ProxyItem {
+        ProxyItem {
+            id: entry.id,
+            bound_count: bound_counts.get(&entry.id).copied().unwrap_or(0),
+            name: entry.name,
+            url: entry.url,
+            username: entry.username,
+            password_set: entry.password.is_some(),
+            note: entry.note,
+            enabled: entry.enabled,
+            created_at: entry.created_at,
+            health,
+        }
+    }
+
+    fn single_proxy_item(&self, id: u64) -> Result<ProxyItem, AdminServiceError> {
+        let entry = self
+            .proxy_pool
+            .get(id)
+            .ok_or(AdminServiceError::ProxyNotFound { id })?;
+        let health = self.proxy_pool.health_of(id);
+        Ok(self.proxy_item(entry, health, &self.bound_counts()))
+    }
+
+    /// 代理列表（含健康状态与绑定数，不含密码）
+    pub fn list_proxies(&self) -> ProxyListResponse {
+        let bound_counts = self.bound_counts();
+        ProxyListResponse {
+            proxies: self
+                .proxy_pool
+                .list()
+                .into_iter()
+                .map(|(entry, health)| self.proxy_item(entry, health, &bound_counts))
+                .collect(),
+        }
+    }
+
+    pub fn add_proxy(&self, input: ProxyInput) -> Result<ProxyItem, AdminServiceError> {
+        let entry = self.proxy_pool.add(input).map_err(map_pool_error)?;
+        self.single_proxy_item(entry.id)
+    }
+
+    pub fn update_proxy(&self, id: u64, input: ProxyInput) -> Result<ProxyItem, AdminServiceError> {
+        self.proxy_pool.update(id, input).map_err(map_pool_error)?;
+        self.single_proxy_item(id)
+    }
+
+    /// 删除代理：仍有未归档凭据绑定时拒绝
+    pub fn remove_proxy(&self, id: u64) -> Result<(), AdminServiceError> {
+        let bound = self.bound_counts().get(&id).copied().unwrap_or(0);
+        self.proxy_pool.remove(id, bound).map_err(map_pool_error)
+    }
+
+    pub fn set_proxy_enabled(&self, id: u64, enabled: bool) -> Result<ProxyItem, AdminServiceError> {
+        self.proxy_pool
+            .set_enabled(id, enabled)
+            .map_err(map_pool_error)?;
+        self.single_proxy_item(id)
+    }
+
+    pub async fn check_proxy(&self, id: u64) -> Result<ProxyItem, AdminServiceError> {
+        self.proxy_pool.check(id).await.map_err(map_pool_error)?;
+        self.single_proxy_item(id)
+    }
+
+    pub async fn check_all_proxies(&self) -> ProxyListResponse {
+        self.proxy_pool.check_all().await;
+        self.list_proxies()
+    }
+
+    /// 修改凭据代理绑定（三选一：proxyId / direct / clear）
+    pub fn set_credential_proxy(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
+        let selected = [req.proxy_id.is_some(), req.direct, req.clear]
+            .iter()
+            .filter(|v| **v)
+            .count();
+        if selected != 1 {
+            return Err(AdminServiceError::InvalidRequest(
+                "proxyId、direct、clear 必须且只能指定一个".into(),
+            ));
+        }
+        let binding = if let Some(proxy_id) = req.proxy_id {
+            self.require_enabled_proxy(proxy_id)?;
+            ProxyBinding::Pool(proxy_id)
+        } else if req.direct {
+            ProxyBinding::Direct
+        } else {
+            ProxyBinding::Clear
+        };
+        self.token_manager
+            .set_proxy_binding(id, binding)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 用凭据实际使用的代理做一次出口检测（不写入代理池健康状态）
+    pub async fn check_credential_egress(
+        &self,
+        id: u64,
+    ) -> Result<CredentialEgressResponse, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .credentials_of(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let proxy = self.proxy_pool.resolve(&credentials);
+        let health = self.proxy_pool.check_with(proxy.as_ref()).await;
+        Ok(CredentialEgressResponse {
+            credential_id: id,
+            proxy_url: proxy.map(|p| display_proxy_url(&p.url)),
+            health,
+        })
+    }
+
+    /// 归档凭据（保留统计与余额缓存，可恢复）
+    pub fn archive_credential(
+        &self,
+        actor: &AuthUser,
+        id: u64,
+        req: ArchiveCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.require_manage_permission(actor, id)?;
+        let reason = req
+            .reason
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
+        self.token_manager
+            .archive_credential(id, actor.id, reason)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 恢复已归档凭据（恢复后仍为禁用状态）
+    pub fn unarchive_credential(&self, actor: &AuthUser, id: u64) -> Result<(), AdminServiceError> {
         self.require_manage_permission(actor, id)?;
         self.token_manager
-            .delete_credential(id)
-            .map_err(|e| self.classify_delete_error(e, id))?;
+            .unarchive_credential(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 彻底删除已归档凭据（仅超级管理员，Token、统计、累计消耗和余额缓存一并删除，无法恢复）
+    pub fn purge_credential(&self, actor: &AuthUser, id: u64) -> Result<(), AdminServiceError> {
+        if actor.role != Role::SuperAdmin {
+            return Err(AdminServiceError::Forbidden(
+                "仅超级管理员可以彻底删除凭据".into(),
+            ));
+        }
+        self.token_manager
+            .purge_credential(id)
+            .map_err(|e| self.classify_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
         {
@@ -443,6 +688,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
+        } else if msg.contains("已归档") || msg.contains("未归档") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
@@ -495,6 +742,7 @@ impl AdminService {
             || msg.contains("refreshToken 为空")
             || msg.contains("refreshToken 已被截断")
             || msg.contains("凭据已存在")
+            || msg.contains("该凭据已归档")
             || msg.contains("refreshToken 重复")
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
@@ -514,17 +762,26 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
+}
 
-    /// 分类删除凭据错误
-    fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
-        if msg.contains("不存在") {
-            AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
-        {
-            AdminServiceError::InvalidCredential(msg)
-        } else {
-            AdminServiceError::InternalError(msg)
+fn map_pool_error(error: ProxyPoolError) -> AdminServiceError {
+    match error {
+        ProxyPoolError::NotFound(id) => AdminServiceError::ProxyNotFound { id },
+        ProxyPoolError::Invalid(_) | ProxyPoolError::InUse { .. } => {
+            AdminServiceError::InvalidRequest(error.to_string())
         }
+        ProxyPoolError::Storage(_) => AdminServiceError::InternalError(error.to_string()),
+    }
+}
+
+/// 去掉代理 URL 中可能内嵌的认证信息，仅用于展示
+fn display_proxy_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => "已配置".to_string(),
     }
 }

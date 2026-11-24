@@ -25,6 +25,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::proxy_pool::ProxyPool;
 use crate::runtime_config::RuntimeConfig;
 
 /// 检查 Token 是否在指定时间内过期
@@ -418,6 +419,8 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
+    used_credits: f64,
 }
 
 /// 禁用原因
@@ -442,6 +445,9 @@ enum DisabledReason {
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    /// 累计消耗的上游积分（旧版统计文件没有该字段时为 0）
+    #[serde(default)]
+    used_credits: f64,
 }
 
 // ============================================================================
@@ -478,11 +484,19 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
+    pub used_credits: f64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
-    /// 代理 URL（用于前端展示）
+    /// 代理 URL（用于前端展示；绑定代理池时为池条目的地址，不含密码）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 绑定的代理池条目 ID
+    pub proxy_id: Option<u64>,
+    /// 绑定的代理池条目名称（条目不存在时为 None）
+    pub proxy_name: Option<String>,
+    /// 绑定的代理池条目最近一次检测到的出口 IP
+    pub egress_ip: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 登记该凭据的管理员账户 ID
@@ -495,6 +509,25 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 是否已归档
+    pub archived: bool,
+    /// 归档时间（RFC3339）
+    pub archived_at: Option<String>,
+    /// 执行归档的管理员账户 ID
+    pub archived_by: Option<i64>,
+    /// 归档原因
+    pub archive_reason: Option<String>,
+}
+
+/// 凭据代理绑定方式（Admin API 改绑代理时使用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyBinding {
+    /// 绑定代理池条目
+    Pool(u64),
+    /// 显式直连
+    Direct,
+    /// 清空，回退到全局代理
+    Clear,
 }
 
 /// 凭据管理器状态快照
@@ -517,7 +550,8 @@ pub struct ManagerSnapshot {
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: Arc<RuntimeConfig>,
-    proxy: Arc<parking_lot::RwLock<Option<ProxyConfig>>>,
+    /// 出口代理池（同时持有全局代理，负责解析每个凭据实际使用的代理）
+    proxy_pool: Arc<ProxyPool>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -600,14 +634,16 @@ impl MultiTokenManager {
                     persisted: Some(cred.clone()),
                     failure_count: 0,
                     refresh_failure_count: 0,
-                    disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason: if cred.disabled {
+                    // 从配置文件读取 disabled 状态；已归档凭据一律视为禁用
+                    disabled: cred.disabled || cred.archived,
+                    disabled_reason: if cred.disabled || cred.archived {
                         Some(DisabledReason::Manual)
                     } else {
                         None
                     },
                     success_count: 0,
                     last_used_at: None,
+                    used_credits: 0.0,
                 }
             })
             .collect();
@@ -655,7 +691,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config_ref.load_balancing_mode.clone();
         let manager = Self {
             config,
-            proxy: Arc::new(parking_lot::RwLock::new(proxy)),
+            proxy_pool: Arc::new(ProxyPool::in_memory(proxy)),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -707,9 +743,22 @@ impl MultiTokenManager {
         self.config.clone()
     }
 
+    /// 替换代理池（启动时注入从文件加载的代理池；保留当前全局代理）
+    pub fn with_proxy_pool(mut self, proxy_pool: Arc<ProxyPool>) -> Self {
+        proxy_pool.set_global_proxy(self.proxy_pool.global_proxy());
+        self.proxy_pool = proxy_pool;
+        self
+    }
+
+    /// 获取出口代理池
+    pub fn proxy_pool(&self) -> Arc<ProxyPool> {
+        self.proxy_pool.clone()
+    }
+
     pub fn replace(&self, config: Config) {
         let proxy = crate::runtime_config::proxy_from_config(&config);
-        *self.proxy.write() = proxy;
+        self.proxy_pool.set_global_proxy(proxy);
+        self.proxy_pool.apply_config(&config);
         *self.load_balancing_mode.lock() = config.load_balancing_mode.clone();
         self.config.replace(config);
     }
@@ -954,8 +1003,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let proxy = self.proxy.read().clone();
-                let effective_proxy = current_creds.effective_proxy(proxy.as_ref());
+                let effective_proxy = self.proxy_pool.resolve(&current_creds);
                 let config = self.config();
                 let new_creds =
                     refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
@@ -1017,6 +1065,12 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
+        self.persist_credentials_with_removed(&[])
+    }
+
+    /// 回写凭据文件，并把 `removed` 中的 ID 作为删除标记交给合并逻辑，
+    /// 使已从内存移除的凭据同时从磁盘文件中删除（否则合并时会按"其他实例新增"保留）
+    fn persist_credentials_with_removed(&self, removed: &[u64]) -> anyhow::Result<bool> {
         use anyhow::Context;
 
         // 仅多凭据格式才回写
@@ -1048,10 +1102,13 @@ impl MultiTokenManager {
                     cred
                 })
                 .collect();
-            let snapshots = entries
+            let mut snapshots: HashMap<u64, Option<KiroCredentials>> = entries
                 .iter()
                 .filter_map(|e| e.persisted.clone().map(|cred| (e.id, Some(cred))))
                 .collect();
+            for id in removed {
+                snapshots.insert(*id, None);
+            }
             (local, snapshots)
         };
         let merged = crate::shared_files::merge_credentials(&local, &snapshots, disk)?;
@@ -1066,6 +1123,21 @@ impl MultiTokenManager {
         } else {
             crate::shared_files::atomic_write(path, &json)
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+        }
+
+        // 写入成功后把合并基线更新为本次写出的本地版本，
+        // 否则字段改回启动时的值（如改绑后再设为直连、归档后恢复）会被误判为未改动而无法落盘
+        {
+            let written: HashMap<u64, KiroCredentials> = local
+                .into_iter()
+                .filter_map(|cred| cred.id.map(|id| (id, cred)))
+                .collect();
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if let Some(cred) = written.get(&entry.id) {
+                    entry.persisted = Some(cred.clone());
+                }
+            }
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1109,6 +1181,7 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.used_credits = s.used_credits;
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1140,6 +1213,7 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            used_credits: e.used_credits,
                         },
                     )
                 })
@@ -1196,6 +1270,27 @@ impl MultiTokenManager {
                     entry.success_count
                 );
             }
+        }
+        self.save_stats_debounced();
+    }
+
+    /// 累加指定凭据消耗的上游积分
+    ///
+    /// 非有限值或 ≤ 0 的值直接忽略；凭据不存在时不做任何事
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    /// * `credits` - 本次请求的上游消耗（metering 事件 credits）
+    pub fn record_credits(&self, id: u64, credits: f64) {
+        if !credits.is_finite() || credits <= 0.0 {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return;
+            };
+            entry.used_credits += credits;
         }
         self.save_stats_debounced();
     }
@@ -1453,6 +1548,13 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        // 先读取代理池，避免持有 entries 锁时再获取代理池锁
+        let pool_items: HashMap<u64, (crate::proxy_pool::ProxyEntry, crate::proxy_pool::ProxyHealth)> =
+            self.proxy_pool
+                .list()
+                .into_iter()
+                .map(|(entry, health)| (entry.id, (entry, health)))
+                .collect();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -1460,7 +1562,16 @@ impl MultiTokenManager {
         ManagerSnapshot {
             entries: entries
                 .iter()
-                .map(|e| CredentialEntrySnapshot {
+                .map(|e| {
+                    let is_direct = e.credentials.proxy_url.as_deref().is_some_and(|url| {
+                        url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT)
+                    });
+                    let bound_proxy = e
+                        .credentials
+                        .proxy_id
+                        .filter(|_| !is_direct)
+                        .and_then(|id| pool_items.get(&id).cloned());
+                    CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
                     disabled: e.disabled,
@@ -1501,8 +1612,15 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
+                    used_credits: e.used_credits,
+                    has_proxy: e.credentials.proxy_url.is_some() || bound_proxy.is_some(),
+                    proxy_url: bound_proxy
+                        .as_ref()
+                        .map(|(entry, _)| entry.url.clone())
+                        .or_else(|| e.credentials.proxy_url.clone()),
+                    proxy_id: e.credentials.proxy_id,
+                    proxy_name: bound_proxy.as_ref().map(|(entry, _)| entry.name.clone()),
+                    egress_ip: bound_proxy.and_then(|(_, health)| health.egress_ip),
                     refresh_failure_count: e.refresh_failure_count,
                     registered_by: e.credentials.registered_by,
                     registered_by_name: e.credentials.registered_by_name.clone(),
@@ -1518,6 +1636,11 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    archived: e.credentials.archived,
+                    archived_at: e.credentials.archived_at.clone(),
+                    archived_by: e.credentials.archived_by,
+                    archive_reason: e.credentials.archive_reason.clone(),
+                    }
                 })
                 .collect(),
             current_id,
@@ -1534,7 +1657,9 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = disabled;
+            if !disabled && entry.credentials.archived {
+                anyhow::bail!("凭据 #{} 已归档，请先恢复", id);
+            }
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -1578,6 +1703,9 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.credentials.archived {
+                anyhow::bail!("凭据 #{} 已归档，请先恢复", id);
+            }
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
@@ -1625,8 +1753,7 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let proxy = self.proxy.read().clone();
-                    let effective_proxy = current_creds.effective_proxy(proxy.as_ref());
+                    let effective_proxy = self.proxy_pool.resolve(&current_creds);
                     let config = self.config();
                     let new_creds =
                         refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
@@ -1664,8 +1791,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let proxy = self.proxy.read().clone();
-        let effective_proxy = credentials.effective_proxy(proxy.as_ref());
+        let effective_proxy = self.proxy_pool.resolve(&credentials);
         let config = self.config();
         let usage_limits =
             get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
@@ -1737,20 +1863,27 @@ impl MultiTokenManager {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?;
             let new_api_key_hash = sha256_hex(new_api_key);
-            let duplicate_exists = {
+            let duplicate = {
                 let entries = self.entries.lock();
-                entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .kiro_api_key
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_api_key_hash.as_str())
-                })
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .credentials
+                            .kiro_api_key
+                            .as_deref()
+                            .map(sha256_hex)
+                            .as_deref()
+                            == Some(new_api_key_hash.as_str())
+                    })
+                    .map(|entry| (entry.id, entry.credentials.archived))
             };
-            if duplicate_exists {
-                anyhow::bail!("凭据已存在（kiroApiKey 重复）");
+            match duplicate {
+                Some((id, true)) => {
+                    anyhow::bail!("该凭据已归档（#{}），请在已归档列表中恢复", id)
+                }
+                Some((_, false)) => anyhow::bail!("凭据已存在（kiroApiKey 重复）"),
+                None => {}
             }
         } else {
             let new_refresh_token = new_cred
@@ -1758,20 +1891,27 @@ impl MultiTokenManager {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
             let new_refresh_token_hash = sha256_hex(new_refresh_token);
-            let duplicate_exists = {
+            let duplicate = {
                 let entries = self.entries.lock();
-                entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .refresh_token
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_refresh_token_hash.as_str())
-                })
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .credentials
+                            .refresh_token
+                            .as_deref()
+                            .map(sha256_hex)
+                            .as_deref()
+                            == Some(new_refresh_token_hash.as_str())
+                    })
+                    .map(|entry| (entry.id, entry.credentials.archived))
             };
-            if duplicate_exists {
-                anyhow::bail!("凭据已存在（refreshToken 重复）");
+            match duplicate {
+                Some((id, true)) => {
+                    anyhow::bail!("该凭据已归档（#{}），请在已归档列表中恢复", id)
+                }
+                Some((_, false)) => anyhow::bail!("凭据已存在（refreshToken 重复）"),
+                None => {}
             }
         }
 
@@ -1779,8 +1919,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let proxy = self.proxy.read().clone();
-            let effective_proxy = new_cred.effective_proxy(proxy.as_ref());
+            let effective_proxy = self.proxy_pool.resolve(&new_cred);
             let config = self.config();
             refresh_token(&new_cred, &config, effective_proxy.as_ref()).await?
         };
@@ -1811,6 +1950,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.proxy_id = new_cred.proxy_id;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.registered_by = new_cred.registered_by;
         validated_cred.registered_by_name = new_cred.registered_by_name;
@@ -1827,6 +1967,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                used_credits: 0.0,
             });
         }
 
@@ -1837,69 +1978,164 @@ impl MultiTokenManager {
         Ok(new_id)
     }
 
-    /// 删除凭据（Admin API）
-    ///
-    /// # 前置条件
-    /// - 凭据必须已禁用（disabled = true）
-    ///
-    /// # 行为
-    /// 1. 验证凭据存在
-    /// 2. 验证凭据已禁用
-    /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
-    /// 5. 如果删除后没有凭据，将 current_id 重置为 0
-    /// 6. 持久化到文件
-    ///
-    /// # 返回
-    /// - `Ok(())` - 删除成功
-    /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
-    pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
-        let was_current = {
-            let mut entries = self.entries.lock();
+    /// 获取指定凭据的当前副本（Admin API）
+    pub fn credentials_of(&self, id: u64) -> Option<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
+    }
 
-            // 查找凭据
+    /// 修改凭据的代理绑定（Admin API）
+    ///
+    /// 改绑后清掉凭据上直填的代理地址和认证；`Direct` 时 `proxy_url = "direct"`。
+    /// provider 的 Client 缓存按 ProxyConfig 做 key，下一次请求自动使用新代理。
+    pub fn set_proxy_binding(&self, id: u64, binding: ProxyBinding) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
             let entry = entries
-                .iter()
+                .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
-            // 检查是否已禁用
-            if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+            if entry.credentials.archived {
+                anyhow::bail!("凭据 #{} 已归档，请先恢复", id);
             }
+            let creds = &mut entry.credentials;
+            creds.proxy_username = None;
+            creds.proxy_password = None;
+            match binding {
+                ProxyBinding::Pool(proxy_id) => {
+                    creds.proxy_id = Some(proxy_id);
+                    creds.proxy_url = None;
+                }
+                ProxyBinding::Direct => {
+                    creds.proxy_id = None;
+                    creds.proxy_url = Some(KiroCredentials::PROXY_DIRECT.to_string());
+                }
+                ProxyBinding::Clear => {
+                    creds.proxy_id = None;
+                    creds.proxy_url = None;
+                }
+            }
+        }
 
-            // 记录是否是当前凭据
-            let current_id = *self.current_id.lock();
-            let was_current = current_id == id;
+        self.persist_credentials()?;
 
-            // 删除凭据
-            entries.retain(|e| e.id != id);
+        tracing::info!("凭据 #{} 代理绑定已更新为 {:?}", id, binding);
+        Ok(())
+    }
 
-            was_current
+    /// 归档凭据（Admin API）
+    ///
+    /// 归档后凭据被禁用、不参与调度，统计数据保留，可通过 `unarchive_credential` 恢复。
+    /// 若归档的是当前凭据，切换到优先级最高的可用凭据；归档后没有未归档凭据时 current_id 重置为 0。
+    pub fn archive_credential(
+        &self,
+        id: u64,
+        actor_id: i64,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let was_current = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.credentials.archived {
+                anyhow::bail!("凭据 #{} 已归档", id);
+            }
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Manual);
+            entry.credentials.disabled = true;
+            entry.credentials.archived = true;
+            entry.credentials.archived_at = Some(Utc::now().to_rfc3339());
+            entry.credentials.archived_by = Some(actor_id);
+            entry.credentials.archive_reason = reason;
+            *self.current_id.lock() == id
         };
 
-        // 如果删除的是当前凭据，切换到优先级最高的可用凭据
+        // 如果归档的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
             self.select_highest_priority();
         }
 
-        // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
+        // 如果归档后没有任何未归档凭据，将 current_id 重置为 0（与初始化行为保持一致）
+        {
+            let entries = self.entries.lock();
+            if entries.iter().all(|e| e.credentials.archived) {
+                let mut current_id = self.current_id.lock();
+                *current_id = 0;
+                tracing::info!("所有凭据均已归档，current_id 已重置为 0");
+            }
+        }
+
+        self.persist_credentials()?;
+
+        tracing::info!("已归档凭据 #{}", id);
+        Ok(())
+    }
+
+    /// 恢复已归档凭据（Admin API）
+    ///
+    /// 恢复后凭据仍保持禁用，需管理员手动启用。
+    pub fn unarchive_credential(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.credentials.archived {
+                anyhow::bail!("凭据 #{} 未归档", id);
+            }
+            entry.credentials.archived = false;
+            entry.credentials.archived_at = None;
+            entry.credentials.archived_by = None;
+            entry.credentials.archive_reason = None;
+        }
+
+        self.persist_credentials()?;
+
+        tracing::info!("已恢复凭据 #{}（仍处于禁用状态）", id);
+        Ok(())
+    }
+
+    /// 彻底删除已归档凭据（Admin API）
+    ///
+    /// 仅允许删除已归档凭据；从内存和凭据文件中移除，并清除其统计（含累计消耗），无法恢复。
+    pub fn purge_credential(&self, id: u64) -> anyhow::Result<()> {
+        let was_current = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.credentials.archived {
+                anyhow::bail!("只能彻底删除已归档的凭据（请先归档凭据 #{}）", id);
+            }
+            entries.retain(|e| e.id != id);
+            *self.current_id.lock() == id
+        };
+
+        if was_current {
+            self.select_highest_priority();
+        }
+
         {
             let entries = self.entries.lock();
             if entries.is_empty() {
-                let mut current_id = self.current_id.lock();
-                *current_id = 0;
+                *self.current_id.lock() = 0;
                 tracing::info!("所有凭据已删除，current_id 已重置为 0");
             }
         }
 
-        // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credentials_with_removed(&[id])?;
 
-        // 立即回写统计数据，清除已删除凭据的残留条目
+        // 统计文件只写现存条目，立即回写即可清除被删凭据的统计
         self.save_stats();
 
-        tracing::info!("已删除凭据 #{}", id);
+        tracing::info!("已彻底删除凭据 #{}", id);
         Ok(())
     }
 
@@ -1921,8 +2157,7 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let proxy = self.proxy.read().clone();
-        let effective_proxy = credentials.effective_proxy(proxy.as_ref());
+        let effective_proxy = self.proxy_pool.resolve(&credentials);
         let config = self.config();
         let new_creds = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
 
@@ -2288,6 +2523,58 @@ mod tests {
     }
 
     #[test]
+    fn test_record_credits_accumulates_and_ignores_invalid_values() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new_for_test(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let used = |id: u64| {
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .used_credits
+        };
+
+        manager.record_credits(1, 0.25);
+        manager.record_credits(1, 1.5);
+        // 非法值：0、负数、NaN、无穷大 都应忽略
+        manager.record_credits(1, 0.0);
+        manager.record_credits(1, -3.0);
+        manager.record_credits(1, f64::NAN);
+        manager.record_credits(1, f64::INFINITY);
+        // 不存在的凭据不影响其它凭据
+        manager.record_credits(99, 5.0);
+
+        assert!((used(1) - 1.75).abs() < 1e-9, "实际: {}", used(1));
+        assert_eq!(used(2), 0.0);
+    }
+
+    #[test]
+    fn test_stats_entry_missing_used_credits_defaults_to_zero() {
+        // 旧版 kiro_stats.json 条目没有 used_credits 字段
+        let legacy = r#"{"success_count":3,"last_used_at":"2026-01-01T00:00:00Z"}"#;
+        let entry: StatsEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(entry.success_count, 3);
+        assert_eq!(entry.used_credits, 0.0);
+
+        let json = serde_json::to_string(&StatsEntry {
+            used_credits: 2.5,
+            ..entry
+        })
+        .unwrap();
+        let roundtrip: StatsEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.used_credits, 2.5);
+    }
+
+    #[test]
     fn test_multi_token_manager_report_failure() {
         let config = Config::default();
         let cred1 = KiroCredentials::default();
@@ -2380,7 +2667,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_credentials_merges_concurrent_changes_and_deletions() {
+    fn persist_credentials_merges_concurrent_changes_and_archives() {
         let path =
             std::env::temp_dir().join(format!("kiro-credentials-{}.json", uuid::Uuid::new_v4()));
         let original = KiroCredentials {
@@ -2408,15 +2695,122 @@ mod tests {
         other.id = Some(2);
         std::fs::write(&path, serde_json::to_string(&vec![other]).unwrap()).unwrap();
         manager.set_disabled(1, true).unwrap();
-        manager.delete_credential(1).unwrap();
+        manager.archive_credential(1, 7, None).unwrap();
         let disk: Vec<KiroCredentials> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(disk.len(), 2);
         assert!(disk.iter().any(|cred| cred.id == Some(2)));
         assert!(
             disk.iter()
+                .any(|cred| cred.id == Some(1) && cred.archived && cred.disabled)
+        );
+        assert!(
+            disk.iter()
                 .any(|cred| cred.access_token.as_deref() == Some("other-token"))
         );
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        let _ = std::fs::remove_file(path.with_file_name("kiro_stats.json"));
+        let _ = std::fs::remove_file(path.with_file_name("kiro_stats.lock"));
+    }
+
+    #[test]
+    fn purge_credential_removes_from_disk_and_stats() {
+        let dir = std::env::temp_dir().join(format!("kiro-purge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        let creds: Vec<KiroCredentials> = (1..=2)
+            .map(|id| KiroCredentials {
+                id: Some(id),
+                refresh_token: Some(format!("refresh-{id}")),
+                priority: id as u32,
+                ..Default::default()
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_string(&creds).unwrap()).unwrap();
+        let manager =
+            MultiTokenManager::new_for_test(Config::default(), creds, None, Some(path.clone()), true)
+                .unwrap();
+        manager.record_credits(1, 1.5);
+        manager.record_credits(2, 2.5);
+        manager.save_stats();
+
+        let err = manager.purge_credential(1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("只能彻底删除已归档的凭据（请先归档凭据 #1）")
+        );
+        assert!(manager.purge_credential(99).unwrap_err().to_string().contains("不存在"));
+
+        manager.archive_credential(1, 7, None).unwrap();
+        manager.purge_credential(1).unwrap();
+
+        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().current_id, 2);
+        let disk: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].id, Some(2));
+        let stats: HashMap<String, serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("kiro_stats.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!stats.contains_key("1"));
+        assert!(stats.contains_key("2"));
+
+        manager.archive_credential(2, 7, None).unwrap();
+        manager.purge_credential(2).unwrap();
+        assert_eq!(manager.snapshot().current_id, 0);
+        let disk: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(disk.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_proxy_binding_persists_and_clears_fields_on_disk() {
+        let path =
+            std::env::temp_dir().join(format!("kiro-credentials-{}.json", uuid::Uuid::new_v4()));
+        let original = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("refresh".into()),
+            proxy_url: Some("http://legacy:1".into()),
+            proxy_username: Some("legacy-user".into()),
+            proxy_password: Some("legacy-pass".into()),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&vec![original.clone()]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new_for_test(
+            Config::default(),
+            vec![original],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        let read_disk = || -> KiroCredentials {
+            let disk: Vec<KiroCredentials> =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            disk.into_iter().find(|c| c.id == Some(1)).unwrap()
+        };
+
+        manager.set_proxy_binding(1, ProxyBinding::Pool(7)).unwrap();
+        let disk = read_disk();
+        assert_eq!(disk.proxy_id, Some(7));
+        assert_eq!(disk.proxy_url, None);
+        assert_eq!(disk.proxy_username, None);
+        assert_eq!(disk.proxy_password, None);
+
+        manager.set_proxy_binding(1, ProxyBinding::Direct).unwrap();
+        let disk = read_disk();
+        assert_eq!(disk.proxy_id, None);
+        assert_eq!(disk.proxy_url.as_deref(), Some("direct"));
+
+        manager.set_proxy_binding(1, ProxyBinding::Clear).unwrap();
+        let disk = read_disk();
+        assert_eq!(disk.proxy_id, None);
+        assert_eq!(disk.proxy_url, None);
+
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_file(path.with_extension("lock"));
         let _ = std::fs::remove_file(path.with_file_name("kiro_stats.json"));
@@ -2726,5 +3120,116 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    fn archive_test_manager() -> MultiTokenManager {
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.refresh_token = Some("r".repeat(150));
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 1;
+        MultiTokenManager::new_for_test(Config::default(), vec![cred1, cred2], None, None, false)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_archive_current_credential_switches_and_disables() {
+        let manager = archive_test_manager();
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        manager
+            .archive_credential(1, 42, Some("不再使用".to_string()))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry.disabled);
+        assert!(entry.archived);
+        assert_eq!(entry.archived_by, Some(42));
+        assert_eq!(entry.archive_reason.as_deref(), Some("不再使用"));
+        assert!(entry.archived_at.is_some());
+        assert_eq!(manager.available_count(), 1);
+
+        let err = manager.archive_credential(1, 42, None).unwrap_err();
+        assert!(err.to_string().contains("凭据 #1 已归档"));
+    }
+
+    #[test]
+    fn test_archive_last_unarchived_credential_resets_current_id() {
+        let manager = archive_test_manager();
+        manager.archive_credential(1, 42, None).unwrap();
+        manager.archive_credential(2, 42, None).unwrap();
+        assert_eq!(manager.snapshot().current_id, 0);
+    }
+
+    #[test]
+    fn test_set_disabled_false_rejected_for_archived_credential() {
+        let manager = archive_test_manager();
+        manager.archive_credential(1, 42, None).unwrap();
+
+        let err = manager.set_disabled(1, false).unwrap_err();
+        assert!(err.to_string().contains("凭据 #1 已归档，请先恢复"));
+        assert!(manager.reset_and_enable(1).is_err());
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap();
+        assert!(entry.disabled);
+    }
+
+    #[test]
+    fn test_unarchive_keeps_credential_disabled() {
+        let manager = archive_test_manager();
+        assert!(manager.unarchive_credential(1).is_err());
+        manager
+            .archive_credential(1, 42, Some("reason".to_string()))
+            .unwrap();
+
+        manager.unarchive_credential(1).unwrap();
+
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap();
+        assert!(!entry.archived);
+        assert!(entry.disabled);
+        assert!(entry.archived_at.is_none());
+        assert!(entry.archived_by.is_none());
+        assert!(entry.archive_reason.is_none());
+
+        // 恢复后可手动启用
+        manager.set_disabled(1, false).unwrap();
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_hits_archived_duplicate() {
+        let manager = archive_test_manager();
+        manager.archive_credential(1, 42, None).unwrap();
+
+        let mut duplicate = KiroCredentials::default();
+        duplicate.refresh_token = Some("r".repeat(150));
+        let err = manager.add_credential(duplicate).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("该凭据已归档（#1），请在已归档列表中恢复")
+        );
+        assert_eq!(manager.total_count(), 2);
+    }
+
+    #[test]
+    fn test_archived_credential_loaded_from_file_is_disabled() {
+        let mut cred = KiroCredentials::default();
+        cred.archived = true;
+        let manager =
+            MultiTokenManager::new_for_test(Config::default(), vec![cred], None, None, false)
+                .unwrap();
+        assert_eq!(manager.available_count(), 0);
+        assert_eq!(manager.snapshot().current_id, 0);
     }
 }

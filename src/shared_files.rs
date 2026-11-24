@@ -11,6 +11,7 @@ pub fn merge_credential(
     local: &KiroCredentials,
     disk: &KiroCredentials,
 ) -> anyhow::Result<KiroCredentials> {
+    let has_snapshot = original.is_some();
     let original = serde_json::to_value(original.unwrap_or(disk))?;
     let local = serde_json::to_value(local)?;
     let disk = serde_json::to_value(disk)?;
@@ -23,6 +24,14 @@ pub fn merge_credential(
         for (field, local_value) in local {
             if original.get(field) != Some(local_value) {
                 merged.insert(field.clone(), local_value.clone());
+            }
+        }
+        // 有快照时，本地清空的字段（序列化时被 skip 掉）同样要同步删除，否则清空操作无法落盘
+        if has_snapshot {
+            for field in original.keys() {
+                if !local.contains_key(field) {
+                    merged.remove(field);
+                }
             }
         }
     }
@@ -170,6 +179,31 @@ mod tests {
         assert_eq!(merged.refresh_token.as_deref(), Some("new-refresh"));
         assert_eq!(merged.expires_at.as_deref(), Some("new-expiry"));
         assert_eq!(merged.profile_arn.as_deref(), Some("new-profile"));
+    }
+
+    #[test]
+    fn merge_propagates_locally_cleared_fields() {
+        let original = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("refresh".into()),
+            proxy_url: Some("direct".into()),
+            proxy_username: Some("user".into()),
+            ..Default::default()
+        };
+        let mut local = original.clone();
+        local.proxy_url = None;
+        local.proxy_username = None;
+        local.proxy_id = Some(3);
+        let disk = KiroCredentials {
+            access_token: Some("other-instance".into()),
+            ..original.clone()
+        };
+        let merged = merge_credential(Some(&original), &local, &disk).unwrap();
+        assert_eq!(merged.proxy_url, None);
+        assert_eq!(merged.proxy_username, None);
+        assert_eq!(merged.proxy_id, Some(3));
+        // 本地未改动的字段仍保留磁盘上的新值
+        assert_eq!(merged.access_token.as_deref(), Some("other-instance"));
     }
 
     #[test]

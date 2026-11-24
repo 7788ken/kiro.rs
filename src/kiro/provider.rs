@@ -11,12 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::accounts::models::CredentialUsage;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
+use crate::proxy_pool::ProxyPool;
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -32,8 +34,8 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
+    /// 出口代理池（持有全局代理，负责解析每个凭据实际使用的代理）
+    proxy_pool: Arc<ProxyPool>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -50,7 +52,7 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
-    /// * `proxy` - 全局代理配置
+    /// * `proxy` - 全局代理配置（同步到 token_manager 持有的代理池）
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
     pub fn with_proxy(
@@ -70,10 +72,12 @@ impl KiroProvider {
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
+        let proxy_pool = token_manager.proxy_pool();
+        proxy_pool.set_global_proxy(proxy);
 
         Self {
             token_manager,
-            global_proxy: proxy,
+            proxy_pool,
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -87,7 +91,7 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = self.proxy_pool.resolve(credentials);
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -113,21 +117,47 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false, None).await
+    }
+
+    /// 发送非流式 API 请求，并把最终成功的凭据 ID 写入 `usage`
+    pub async fn call_api_with_usage(
+        &self,
+        request_body: &str,
+        usage: &CredentialUsage,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, Some(usage))
+            .await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(request_body, true, None).await
+    }
+
+    /// 发送流式 API 请求，并把最终成功的凭据 ID 写入 `usage`
+    pub async fn call_api_stream_with_usage(
+        &self,
+        request_body: &str,
+        usage: &CredentialUsage,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, Some(usage))
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+        self.call_mcp_with_retry(request_body, None).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    ///
+    /// `usage` 不为空时，成功响应后写入所用凭据 ID
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        usage: Option<&CredentialUsage>,
+    ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -196,6 +226,9 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                if let Some(usage) = usage {
+                    usage.set_credential_id(ctx.id);
+                }
                 return Ok(response);
             }
 
@@ -282,10 +315,13 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    ///
+    /// `usage` 不为空时，成功响应后写入所用凭据 ID（换凭据重试时以最终成功的为准）
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
+        usage: Option<&CredentialUsage>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -360,6 +396,9 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                if let Some(usage) = usage {
+                    usage.set_credential_id(ctx.id);
+                }
                 return Ok(response);
             }
 

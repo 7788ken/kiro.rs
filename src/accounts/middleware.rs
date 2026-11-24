@@ -17,6 +17,8 @@ pub struct AccountState {
     pub tracker: crate::admin::RequestTracker,
     pub legacy_admin_key: String,
     pub legacy_api_key: Option<String>,
+    /// 凭据管理器（用于结算时累计凭据的上游消耗；测试中可为空）
+    pub token_manager: Option<Arc<crate::kiro::token_manager::MultiTokenManager>>,
 }
 
 impl AccountState {
@@ -26,11 +28,20 @@ impl AccountState {
             tracker: crate::admin::RequestTracker::new(),
             legacy_admin_key: legacy_admin_key.into(),
             legacy_api_key: None,
+            token_manager: None,
         }
     }
 
     pub fn with_legacy_api_key(mut self, key: impl Into<String>) -> Self {
         self.legacy_api_key = Some(key.into());
+        self
+    }
+
+    pub fn with_token_manager(
+        mut self,
+        token_manager: Arc<crate::kiro::token_manager::MultiTokenManager>,
+    ) -> Self {
+        self.token_manager = Some(token_manager);
         self
     }
 }

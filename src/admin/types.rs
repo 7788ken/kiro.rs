@@ -50,11 +50,22 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
+    pub used_credits: f64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
-    /// 代理 URL（用于前端展示）
+    /// 代理 URL（用于前端展示；绑定代理池时为池条目地址，不含密码）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 绑定的代理池条目 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+    /// 绑定的代理池条目名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
+    /// 绑定代理最近一次检测到的出口 IP
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_ip: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 登记该凭据的管理员账户 ID
@@ -68,9 +79,29 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 是否已归档
+    pub archived: bool,
+    /// 归档时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// 执行归档的管理员账户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<i64>,
+    /// 归档原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
 }
 
 // ============ 操作请求 ============
+
+/// 归档凭据请求
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveCredentialRequest {
+    /// 归档原因（可选）
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]
@@ -138,6 +169,10 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 绑定的代理池条目 ID（可选，与 proxyUrl 互斥；都不传时自动从健康代理中分配）
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +198,68 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+/// 修改凭据代理绑定请求（三选一）
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    /// 绑定代理池条目
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+    /// 设为直连
+    #[serde(default)]
+    pub direct: bool,
+    /// 清空，回退到全局代理
+    #[serde(default)]
+    pub clear: bool,
+}
+
+// ============ 出口代理池 ============
+
+/// 代理池条目（对外展示，不含密码）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyItem {
+    pub id: u64,
+    pub name: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// 是否已配置密码（密码本身不返回）
+    pub password_set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub health: crate::proxy_pool::ProxyHealth,
+    /// 绑定该代理的未归档凭据数
+    pub bound_count: usize,
+}
+
+/// 代理池列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyListResponse {
+    pub proxies: Vec<ProxyItem>,
+}
+
+/// 设置代理启用状态请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyEnabledRequest {
+    pub enabled: bool,
+}
+
+/// 凭据出口检测响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialEgressResponse {
+    pub credential_id: u64,
+    /// 实际使用的代理地址（不含密码），直连时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    pub health: crate::proxy_pool::ProxyHealth,
 }
 
 // ============ 余额查询 ============

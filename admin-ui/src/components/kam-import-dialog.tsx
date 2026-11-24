@@ -13,8 +13,8 @@ import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Progress } from '@/components/ui/progress'
 import { textareaClass } from '@/components/ui/input'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { useCredentials, useAddCredential, useArchiveCredential } from '@/hooks/use-credentials'
+import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -164,19 +164,15 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
-  const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const { mutateAsync: archiveCredential } = useArchiveCredential()
 
+  // 回滚：归档（归档会同时禁用凭据，统计保留，可在已归档列表中恢复）
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
-      await setCredentialDisabled(id, true)
-    } catch (error) {
-      return { success: false, error: `禁用失败: ${extractErrorMessage(error)}` }
-    }
-    try {
-      await deleteCredential(id)
+      await archiveCredential({ id, reason: '导入验活失败' })
       return { success: true }
     } catch (error) {
-      return { success: false, error: `删除失败: ${extractErrorMessage(error)}` }
+      return { success: false, error: `归档失败: ${extractErrorMessage(error)}` }
     }
   }
 

@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
-import { ReceiptText, Settings2, ShieldCheck, UsersRound, Wallet, BarChart3, Activity, type LucideIcon } from 'lucide-react'
+import { ReceiptText, Settings2, ShieldCheck, UsersRound, Wallet, BarChart3, Activity, Globe, type LucideIcon } from 'lucide-react'
 
-export const adminSections = ['monitor', 'credentials', 'usage', 'users', 'overview', 'transactions', 'settings'] as const
+export const adminSections = ['monitor', 'credentials', 'proxies', 'usage', 'users', 'overview', 'transactions', 'settings'] as const
 export type AdminSection = typeof adminSections[number]
 
 export const sectionMeta: Record<AdminSection, { title: string; description: string }> = {
   monitor: { title: '运行概览', description: '查看实时请求速率、当前并发、最近调用及上游凭据池状态。' },
   credentials: { title: '上游凭据', description: '搜索、筛选和管理本人及下级代理登记的凭证。' },
+  proxies: { title: '出口代理', description: '维护代理池，查看每个代理的出口 IP、健康状态和绑定的凭据数。' },
   usage: { title: '用量统计', description: '按日期、用户、模型和状态聚合 Token，以及锚定到凭证真实消耗的积分。' },
   users: { title: '用户与额度', description: '创建下级代理或普通用户，管理自己分支内的账户与积分。' },
   overview: { title: '我的账户', description: '查看账户余额、Token 用量与当前计费标准。' },
@@ -17,6 +18,7 @@ export const sectionMeta: Record<AdminSection, { title: string; description: str
 export const sectionNavItems = [
   { id: 'monitor', label: '运行概览', icon: Activity, requiresManager: true },
   { id: 'credentials', label: '上游凭据', icon: ShieldCheck, requiresManager: true },
+  { id: 'proxies', label: '出口代理', icon: Globe, requiresManager: true },
   { id: 'usage', label: '用量统计', icon: BarChart3 },
   { id: 'users', label: '用户与额度', icon: UsersRound, requiresManager: true },
   { id: 'overview', label: '我的账户', icon: Wallet },

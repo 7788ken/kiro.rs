@@ -8,10 +8,12 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  SetCredentialProxyRequest,
+  CredentialEgressResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
-const api = axios.create({
+export const api = axios.create({
   baseURL: '/api/admin',
   headers: {
     'Content-Type': 'application/json',
@@ -27,9 +29,11 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 获取所有凭据状态
-export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+// 获取凭据状态（includeArchived 为 true 时包含已归档凭据）
+export async function getCredentials(includeArchived = false): Promise<CredentialsStatusResponse> {
+  const { data } = await api.get<CredentialsStatusResponse>('/credentials', {
+    params: includeArchived ? { includeArchived: true } : undefined,
+  })
   return data
 }
 
@@ -87,9 +91,33 @@ export async function addCredential(
   return data
 }
 
-// 删除凭据
-export async function deleteCredential(id: number): Promise<SuccessResponse> {
+// 归档凭据
+export async function archiveCredential(id: number, reason?: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/archive`, { reason: reason || undefined })
+  return data
+}
+
+// 恢复已归档凭据（恢复后仍为禁用状态）
+export async function unarchiveCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/unarchive`)
+  return data
+}
+
+// 彻底删除已归档凭据（仅超级管理员，无法恢复）
+export async function purgeCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+// 修改凭据代理绑定
+export async function setCredentialProxy(id: number, req: SetCredentialProxyRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/credentials/${id}/proxy`, req)
+  return data
+}
+
+// 用凭据实际使用的代理检测出口 IP
+export async function checkCredentialEgress(id: number): Promise<CredentialEgressResponse> {
+  const { data } = await api.post<CredentialEgressResponse>(`/credentials/${id}/check-egress`)
   return data
 }
 

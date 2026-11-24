@@ -10,7 +10,9 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input, formControlClass } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
+import { useProxies } from '@/hooks/use-proxies'
 import { extractErrorMessage } from '@/lib/utils'
+import { proxyOptionLabel } from '@/components/proxy-binding-dialog'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -18,6 +20,14 @@ interface AddCredentialDialogProps {
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
+type ProxyMode = 'auto' | 'pool' | 'direct' | 'manual'
+
+const proxyModeOptions: { value: ProxyMode; label: string; hint: string }[] = [
+  { value: 'auto', label: '自动分配（推荐）', hint: '从健康的代理中挑绑定凭据最少的一个；代理池为空时沿用全局代理' },
+  { value: 'pool', label: '指定代理', hint: '固定绑定所选代理池条目' },
+  { value: 'direct', label: '直连（direct）', hint: '不使用任何代理，即使配置了全局代理' },
+  { value: 'manual', label: '手动填写代理地址', hint: '为该凭据单独填写代理，不进入代理池' },
+]
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -33,9 +43,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('auto')
+  const [proxyId, setProxyId] = useState('')
   const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
+  const proxiesQuery = useProxies(open)
+  const enabledProxies = (proxiesQuery.data?.proxies ?? []).filter(proxy => proxy.enabled)
 
   const resetForm = () => {
     setRefreshToken('')
@@ -51,6 +65,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setProxyMode('auto')
+    setProxyId('')
     setEndpoint('')
   }
 
@@ -77,6 +93,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
     }
 
+    if (proxyMode === 'pool' && !proxyId) {
+      toast.error('请选择要绑定的代理')
+      return
+    }
+    if (proxyMode === 'manual' && !proxyUrl.trim()) {
+      toast.error('请填写代理地址')
+      return
+    }
+    const manual = proxyMode === 'manual'
+
     mutate(
       {
         authMethod,
@@ -89,9 +115,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        proxyUrl: proxyMode === 'direct' ? 'direct' : manual ? proxyUrl.trim() : undefined,
+        proxyUsername: manual ? proxyUsername.trim() || undefined : undefined,
+        proxyPassword: manual ? proxyPassword.trim() || undefined : undefined,
+        proxyId: proxyMode === 'pool' ? Number(proxyId) : undefined,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -287,34 +314,56 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* 代理配置 */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={isPending}
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
-                />
+              <span className="text-sm font-medium">出口代理</span>
+              <div role="radiogroup" aria-label="出口代理" className="grid gap-2 sm:grid-cols-2">
+                {proxyModeOptions.map(option => (
+                  <label key={option.value} className={`flex cursor-pointer items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors ${proxyMode === option.value ? 'border-primary/50 bg-primary/[0.04]' : 'hover:bg-muted/40'}`}>
+                    <input type="radio" name="proxyMode" value={option.value} checked={proxyMode === option.value} onChange={() => setProxyMode(option.value)} disabled={isPending} className="mt-0.5 accent-[hsl(var(--primary))]" />
+                    <span><span className="font-medium">{option.label}</span><span className="mt-0.5 block text-xs text-muted-foreground">{option.hint}</span></span>
+                  </label>
+                ))}
               </div>
-              <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
-              </p>
+              {proxyMode === 'pool' && (
+                <select
+                  id="proxyId"
+                  aria-label="选择代理"
+                  value={proxyId}
+                  onChange={(e) => setProxyId(e.target.value)}
+                  disabled={isPending || proxiesQuery.isLoading}
+                  className={formControlClass}
+                >
+                  <option value="">{proxiesQuery.isLoading ? '正在加载代理…' : enabledProxies.length ? '请选择代理' : '暂无启用的代理'}</option>
+                  {enabledProxies.map(proxy => <option key={proxy.id} value={proxy.id}>{proxyOptionLabel(proxy)}</option>)}
+                </select>
+              )}
+              {proxyMode === 'manual' && (
+                <>
+                  <Input
+                    id="proxyUrl"
+                    placeholder="代理 URL，如 http://host:port 或 socks5://host:port"
+                    value={proxyUrl}
+                    onChange={(e) => setProxyUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      id="proxyUsername"
+                      placeholder="代理用户名"
+                      value={proxyUsername}
+                      onChange={(e) => setProxyUsername(e.target.value)}
+                      disabled={isPending}
+                    />
+                    <Input
+                      id="proxyPassword"
+                      type="password"
+                      placeholder="代理密码"
+                      value={proxyPassword}
+                      onChange={(e) => setProxyPassword(e.target.value)}
+                      disabled={isPending}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           </div>
 

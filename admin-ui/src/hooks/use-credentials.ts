@@ -7,17 +7,21 @@ import {
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
-  deleteCredential,
+  archiveCredential,
+  unarchiveCredential,
+  purgeCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  setCredentialProxy,
+  checkCredentialEgress,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, SetCredentialProxyRequest } from '@/types/api'
 
-// 查询凭据列表
-export function useCredentials() {
+// 查询凭据列表（includeArchived 为 true 时包含已归档凭据）
+export function useCredentials(includeArchived = false) {
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', { includeArchived }],
+    queryFn: () => getCredentials(includeArchived),
     refetchInterval: 30000, // 每 30 秒刷新一次
   })
 }
@@ -85,18 +89,61 @@ export function useAddCredential() {
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
     },
   })
 }
 
-// 删除凭据
-export function useDeleteCredential() {
+// 归档凭据
+export function useArchiveCredential() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (id: number) => deleteCredential(id),
+    mutationFn: ({ id, reason }: { id: number; reason?: string }) => archiveCredential(id, reason),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
+  })
+}
+
+// 恢复已归档凭据
+export function useUnarchiveCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => unarchiveCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 彻底删除已归档凭据（仅超级管理员）
+export function usePurgeCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => purgeCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+    },
+  })
+}
+
+// 修改凭据代理绑定
+export function useSetCredentialProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: number; req: SetCredentialProxyRequest }) => setCredentialProxy(id, req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+    },
+  })
+}
+
+// 检测凭据出口 IP
+export function useCheckCredentialEgress() {
+  return useMutation({
+    mutationFn: (id: number) => checkCredentialEgress(id),
   })
 }
 

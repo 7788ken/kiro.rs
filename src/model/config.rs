@@ -109,6 +109,10 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 出口代理健康检测地址（GET 后响应体应为纯文本 IP），默认 https://checkip.amazonaws.com
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_check_url: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -184,6 +188,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            egress_check_url: None,
             config_path: None,
         }
     }
@@ -205,6 +210,15 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 获取出口代理检测地址，未配置或为空时使用默认值
+    pub fn effective_egress_check_url(&self) -> &str {
+        self.egress_check_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(crate::proxy_pool::DEFAULT_EGRESS_CHECK_URL)
     }
 
     /// 从文件加载配置

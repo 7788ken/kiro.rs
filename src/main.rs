@@ -7,6 +7,7 @@ mod http_client;
 mod kiro;
 mod lifecycle;
 mod model;
+mod proxy_pool;
 mod runtime_config;
 mod shared_files;
 pub mod token;
@@ -143,6 +144,16 @@ async fn main() {
         config.clone(),
         config_path.clone(),
     ));
+    let proxy_pool_dir = Path::new(&credentials_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let proxy_pool = proxy_pool::ProxyPool::load(&proxy_pool_dir, proxy_config.clone(), &config)
+        .unwrap_or_else(|e| {
+            tracing::error!("加载出口代理池失败: {}", e);
+            std::process::exit(1);
+        });
+    let proxy_pool = Arc::new(proxy_pool);
     let token_manager = MultiTokenManager::new(
         runtime_config.clone(),
         credentials_list,
@@ -153,8 +164,11 @@ async fn main() {
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
-    });
+    })
+    .with_proxy_pool(proxy_pool.clone());
     let token_manager = Arc::new(token_manager);
+    spawn_proxy_health_checker(proxy_pool);
+    let account_state = account_state.with_token_manager(token_manager.clone());
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -230,6 +244,37 @@ async fn main() {
         .with_graceful_shutdown(lifecycle::shutdown_signal(lifecycle))
         .await
         .unwrap();
+}
+
+/// 出口代理健康检测间隔
+const PROXY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 后台定时检测出口代理：启动后立即检测一次，之后每 10 分钟一次。
+/// 单轮检测 panic 只记录日志，不影响主服务和后续轮次。
+fn spawn_proxy_health_checker(pool: Arc<proxy_pool::ProxyPool>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PROXY_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let pool = pool.clone();
+            match tokio::spawn(async move { pool.check_all().await }).await {
+                Ok(results) if !results.is_empty() => {
+                    let healthy = results
+                        .iter()
+                        .filter(|(_, h)| h.status == proxy_pool::ProxyStatus::Healthy)
+                        .count();
+                    tracing::info!(
+                        "出口代理检测完成：{} 个健康 / 共 {} 个",
+                        healthy,
+                        results.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("出口代理检测任务异常: {}", e),
+            }
+        }
+    });
 }
 
 fn account_db_path(config_path: &str) -> PathBuf {

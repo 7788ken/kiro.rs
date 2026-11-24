@@ -34,6 +34,11 @@ impl ErrorResponse {
     pub fn authentication_error() -> Self {
         Self::new("authentication_error", "Invalid API key")
     }
+
+    /// 创建权限错误响应
+    pub fn permission_error(message: impl Into<String>) -> Self {
+        Self::new("permission_error", message)
+    }
 }
 
 // === Models 端点类型 ===

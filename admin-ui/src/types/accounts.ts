@@ -57,6 +57,7 @@ export interface CreditTransaction {
   errorMessage?: string
   durationMs?: number
   firstTokenMs?: number
+  credentialId?: number
 }
 
 export interface CreditChange {

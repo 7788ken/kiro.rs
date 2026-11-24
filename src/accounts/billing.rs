@@ -20,6 +20,7 @@ use crate::{
         models::{AuthUser, CredentialUsage, RequestLog, Reservation},
         store::AccountError,
     },
+    kiro::token_manager::MultiTokenManager,
     token,
 };
 
@@ -162,6 +163,7 @@ pub async fn billing_middleware(
         started_at,
         state.tracker.begin(&user, &path, &model, stream),
         credential_usage,
+        state.token_manager.clone(),
     );
     let response = next.run(request).await;
     guard.http_status = response.status().as_u16();
@@ -227,6 +229,7 @@ struct BillingGuard {
     completed: bool,
     credential_usage: CredentialUsage,
     reported_credits: Option<f64>,
+    token_manager: Option<Arc<MultiTokenManager>>,
 }
 
 impl BillingGuard {
@@ -239,6 +242,7 @@ impl BillingGuard {
         started_at: Instant,
         live: crate::admin::TrackedRequestGuard,
         credential_usage: CredentialUsage,
+        token_manager: Option<Arc<MultiTokenManager>>,
     ) -> Self {
         Self {
             store,
@@ -257,6 +261,7 @@ impl BillingGuard {
             completed: false,
             credential_usage,
             reported_credits: None,
+            token_manager,
         }
     }
 
@@ -408,12 +413,20 @@ impl BillingGuard {
             }
             let billed_success = success && self.error_message.is_none();
             let credential_credits = self.credential_usage.get().or(self.reported_credits);
+            let credential_id = self.credential_usage.credential_id();
+            // 累计到凭据统计：记上游真实消耗，不乘用户结算倍率
+            if let (Some(token_manager), Some(id), Some(credits)) =
+                (self.token_manager.as_ref(), credential_id, credential_credits)
+            {
+                token_manager.record_credits(id, credits);
+            }
             if let Err(error) = self.store.settle(
                 &reservation,
                 billed_success,
                 input,
                 self.output_tokens,
                 credential_credits,
+                credential_id,
                 Some(&log),
             ) {
                 tracing::error!(reservation = %reservation.id, "结算积分失败: {}", error);

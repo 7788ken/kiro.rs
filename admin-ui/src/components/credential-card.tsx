@@ -1,15 +1,17 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, KeyRound, Server, Check, X } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Archive, ArchiveRestore, Loader2, KeyRound, Server, Check, X, Globe, Trash2 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
-import { useSetDisabled, useSetPriority, useResetFailure, useDeleteCredential, useForceRefreshToken } from '@/hooks/use-credentials'
+import { useSetDisabled, useSetPriority, useResetFailure, useArchiveCredential, useUnarchiveCredential, usePurgeCredential, useForceRefreshToken } from '@/hooks/use-credentials'
+import { ArchiveCredentialDialog } from '@/components/archive-credential-dialog'
+import { PurgeCredentialDialog } from '@/components/purge-credential-dialog'
+import { ProxyBindingDialog, credentialProxyLabel } from '@/components/proxy-binding-dialog'
 import { cn } from '@/lib/utils'
 
 interface CredentialCardProps {
@@ -19,6 +21,8 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  /** 是否显示彻底删除（仅超级管理员在已归档视图下） */
+  canPurge?: boolean
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -32,15 +36,20 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${Math.floor(hours / 24)} 天前`
 }
 
-export function CredentialCard({ credential, onViewBalance, selected, onToggleSelect, balance, loadingBalance }: CredentialCardProps) {
+export function CredentialCard({ credential, onViewBalance, selected, onToggleSelect, balance, loadingBalance, canPurge = false }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
-  const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showArchiveDialog, setShowArchiveDialog] = useState(false)
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
+  const [showPurgeDialog, setShowPurgeDialog] = useState(false)
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
-  const deleteCredential = useDeleteCredential()
+  const archiveCredential = useArchiveCredential()
+  const unarchiveCredential = useUnarchiveCredential()
+  const purgeCredential = usePurgeCredential()
   const forceRefresh = useForceRefreshToken()
+  const archived = credential.archived
 
   const handleToggleDisabled = () => setDisabled.mutate({ id: credential.id, disabled: !credential.disabled }, { onSuccess: res => toast.success(res.message), onError: err => toast.error('操作失败: ' + (err as Error).message) })
   const handlePriorityChange = () => {
@@ -52,10 +61,10 @@ export function CredentialCard({ credential, onViewBalance, selected, onToggleSe
   const changePriority = (priority: number) => setPriority.mutate({ id: credential.id, priority }, { onSuccess: res => toast.success(res.message), onError: err => toast.error('操作失败: ' + (err as Error).message) })
   const handleReset = () => resetFailure.mutate(credential.id, { onSuccess: res => toast.success(res.message), onError: err => toast.error('操作失败: ' + (err as Error).message) })
   const handleForceRefresh = () => forceRefresh.mutate(credential.id, { onSuccess: res => toast.success(res.message), onError: err => toast.error('刷新失败: ' + (err as Error).message) })
-  const handleDelete = () => {
-    if (!credential.disabled) { toast.error('请先禁用凭据再删除'); setShowDeleteDialog(false); return }
-    deleteCredential.mutate(credential.id, { onSuccess: res => { toast.success(res.message); setShowDeleteDialog(false) }, onError: err => toast.error('删除失败: ' + (err as Error).message) })
-  }
+  const handleArchive = (reason: string) => archiveCredential.mutate({ id: credential.id, reason }, { onSuccess: res => { toast.success(res.message); setShowArchiveDialog(false) }, onError: err => toast.error('归档失败: ' + (err as Error).message) })
+  const handleUnarchive = () => unarchiveCredential.mutate(credential.id, { onSuccess: () => toast.success('已恢复，凭据仍处于禁用状态，请手动启用'), onError: err => toast.error('恢复失败: ' + (err as Error).message) })
+  const handlePurge = () => purgeCredential.mutate(credential.id, { onSuccess: res => { toast.success(res.message); setShowPurgeDialog(false) }, onError: err => toast.error('彻底删除失败: ' + (err as Error).message) })
+  const proxyLabel = credentialProxyLabel(credential)
   const authMethod = credential.authMethod === 'api_key' ? 'API Key' : credential.authMethod === 'idc' ? 'IdC' : credential.authMethod === 'social' ? 'Social' : credential.authMethod
 
   return (
@@ -63,28 +72,31 @@ export function CredentialCard({ credential, onViewBalance, selected, onToggleSe
       <Card className={cn('flex h-full flex-col overflow-hidden transition-[border-color,box-shadow] duration-150 hover:border-border', credential.isCurrent && 'border-primary/35 shadow-[0_0_0_1px_hsl(var(--primary)/0.1)]', credential.disabled && 'bg-muted/20')}>
         <CardContent className="flex flex-1 flex-col p-5">
           <div className="flex items-start gap-3">
-            <Checkbox aria-label={`选择凭据 ${credential.id}`} checked={selected} onCheckedChange={onToggleSelect} disabled={!credential.canManage} className="mt-1 before:absolute before:-inset-3 before:content-['']" />
+            {!archived && <Checkbox aria-label={`选择凭据 ${credential.id}`} checked={selected} onCheckedChange={onToggleSelect} disabled={!credential.canManage} className="mt-1 before:absolute before:-inset-3 before:content-['']" />}
             <div className="min-w-0 flex-1"><div className="flex items-center gap-2"><div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/[0.07] text-primary">{credential.authMethod === 'api_key' ? <KeyRound className="h-4 w-4" /> : <Server className="h-4 w-4" />}</div><div className="min-w-0"><h3 className="truncate text-sm font-semibold" title={credential.email}>{credential.email || `Kiro 凭据 #${credential.id}`}</h3><p className="mt-0.5 font-mono text-[11px] text-muted-foreground">ID {credential.id} · {credential.endpoint}</p></div></div></div>
-            <Switch aria-label={`${credential.disabled ? '启用' : '禁用'}凭据 ${credential.id}`} checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={!credential.canManage || setDisabled.isPending} />
+            {!archived && <Switch aria-label={`${credential.disabled ? '启用' : '禁用'}凭据 ${credential.id}`} checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={!credential.canManage || setDisabled.isPending} />}
           </div>
-          <div className="mt-4 flex flex-wrap gap-1.5"><Badge variant={credential.isCurrent ? 'default' : credential.disabled ? 'secondary' : 'success'}>{credential.isCurrent ? '当前活跃' : credential.disabled ? '已禁用' : '可用'}</Badge>{authMethod && <Badge variant="outline">{authMethod}</Badge>}{credential.hasProfileArn && <Badge variant="outline">已配置 Profile</Badge>}{!credential.canManage && <Badge variant="secondary">仅查看</Badge>}{credential.disabledReason && <Badge variant="warning">{credential.disabledReason}</Badge>}</div>
+          <div className="mt-4 flex flex-wrap gap-1.5">{archived ? <Badge variant="secondary">已归档</Badge> : <Badge variant={credential.isCurrent ? 'default' : credential.disabled ? 'secondary' : 'success'}>{credential.isCurrent ? '当前活跃' : credential.disabled ? '已禁用' : '可用'}</Badge>}{authMethod && <Badge variant="outline">{authMethod}</Badge>}{credential.hasProfileArn && <Badge variant="outline">已配置 Profile</Badge>}{!credential.canManage && <Badge variant="secondary">仅查看</Badge>}{!archived && credential.disabledReason && <Badge variant="warning">{credential.disabledReason}</Badge>}</div>
           <p className="mt-3 text-xs text-muted-foreground">登记人：<span className="font-medium text-foreground">{credential.registeredByName || '历史凭证（超管管理）'}</span></p>
+          {credential.archiveReason && <p className="mt-1 break-words text-xs text-muted-foreground">归档原因：<span className="text-foreground">{credential.archiveReason}</span></p>}
 
           <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-4 border-t pt-4">
-            <Info label="优先级"><div className="flex items-center gap-1">{!credential.canManage ? <span className="flex min-h-10 items-center font-semibold tabular-nums">{credential.priority}</span> : editingPriority ? <><Input aria-label="编辑优先级" type="number" value={priorityValue} onChange={e => setPriorityValue(e.target.value)} className="h-10 w-[68px] px-2" min="0" /><Button size="icon" variant="ghost" aria-label="保存优先级" onClick={handlePriorityChange} disabled={setPriority.isPending}><Check /></Button><Button size="icon" variant="ghost" aria-label="取消编辑" onClick={() => { setEditingPriority(false); setPriorityValue(String(credential.priority)) }}><X /></Button></> : <button className="flex min-h-10 items-center gap-1.5 rounded-md font-semibold tabular-nums hover:text-primary" onClick={() => setEditingPriority(true)} title="点击编辑优先级">{credential.priority}<ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /></button>}</div></Info>
+            <Info label="优先级"><div className="flex items-center gap-1">{!credential.canManage || archived ? <span className="flex min-h-10 items-center font-semibold tabular-nums">{credential.priority}</span> : editingPriority ? <><Input aria-label="编辑优先级" type="number" value={priorityValue} onChange={e => setPriorityValue(e.target.value)} className="h-10 w-[68px] px-2" min="0" /><Button size="icon" variant="ghost" aria-label="保存优先级" onClick={handlePriorityChange} disabled={setPriority.isPending}><Check /></Button><Button size="icon" variant="ghost" aria-label="取消编辑" onClick={() => { setEditingPriority(false); setPriorityValue(String(credential.priority)) }}><X /></Button></> : <button className="flex min-h-10 items-center gap-1.5 rounded-md font-semibold tabular-nums hover:text-primary" onClick={() => setEditingPriority(true)} title="点击编辑优先级">{credential.priority}<ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /></button>}</div></Info>
             <Info label="订阅等级"><span className="flex min-h-10 items-center font-medium">{loadingBalance ? <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" /> : balance?.subscriptionTitle || '未查询'}</span></Info>
             <Info label="成功 / 失败"><span className="flex min-h-10 items-center tabular-nums"><span>{credential.successCount}</span><span className="mx-1.5 text-muted-foreground">/</span><span className={credential.failureCount > 0 ? 'text-destructive' : ''}>{credential.failureCount}</span></span></Info>
             <Info label="最后调用"><span className="flex min-h-10 items-center">{formatLastUsed(credential.lastUsedAt)}</span></Info>
           </div>
 
-          <div className="mt-4 rounded-lg bg-muted/45 px-3 py-3"><div className="flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>上游剩余额度</span>{loadingBalance ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <span className="font-medium text-foreground tabular-nums">{balance ? `${balance.remaining.toFixed(2)} / ${balance.usageLimit.toFixed(2)}` : '尚未查询'}</span>}</div>{balance && <><div className="mt-2 h-1.5 overflow-hidden rounded-full bg-background"><div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${Math.min(100, Math.max(0, 100 - balance.usagePercentage))}%` }} /></div><p className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">{(100 - balance.usagePercentage).toFixed(1)}% 可用</p></>}</div>
-          {(credential.maskedApiKey || credential.hasProxy) && <div className="mt-3 space-y-1.5 text-xs text-muted-foreground">{credential.maskedApiKey && <p className="truncate font-mono">{credential.maskedApiKey}</p>}{credential.hasProxy && <p className="truncate">代理：{credential.proxyUrl}</p>}</div>}
+          <div className="mt-4 rounded-lg bg-muted/45 px-3 py-3"><div className="flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>上游剩余额度</span>{loadingBalance ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <span className="font-medium text-foreground tabular-nums">{balance ? `${balance.remaining.toFixed(2)} / ${balance.usageLimit.toFixed(2)}` : '尚未查询'}</span>}</div>{balance && <><div className="mt-2 h-1.5 overflow-hidden rounded-full bg-background"><div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${Math.min(100, Math.max(0, 100 - balance.usagePercentage))}%` }} /></div><p className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">{(100 - balance.usagePercentage).toFixed(1)}% 可用</p></>}<div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>累计消耗</span><span className="font-medium text-foreground tabular-nums">{credential.usedCredits.toFixed(2)} 积分</span></div></div>
+          {(credential.maskedApiKey || proxyLabel) && <div className="mt-3 space-y-1.5 text-xs text-muted-foreground">{credential.maskedApiKey && <p className="truncate font-mono">{credential.maskedApiKey}</p>}{proxyLabel && <p className="truncate" title={proxyLabel}>代理：{proxyLabel}</p>}</div>}
 
-          <div className="mt-auto pt-5"><div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => onViewBalance(credential.id)}><Wallet />查看额度</Button>{credential.canManage && <><Button size="sm" variant="ghost" onClick={handleForceRefresh} disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'} title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token'}><RefreshCw className={forceRefresh.isPending ? 'animate-spin' : ''} />刷新 Token</Button><Button size="icon" variant="ghost" title="重置失败次数" aria-label={`重置凭据 ${credential.id} 的失败次数`} onClick={handleReset} disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}><RotateCcwIcon /></Button><Button size="icon" variant="ghost" title="提高优先级" aria-label={`提高凭据 ${credential.id} 的优先级`} onClick={() => changePriority(Math.max(0, credential.priority - 1))} disabled={setPriority.isPending || credential.priority === 0}><ChevronUp /></Button><Button size="icon" variant="ghost" title="降低优先级" aria-label={`降低凭据 ${credential.id} 的优先级`} onClick={() => changePriority(credential.priority + 1)} disabled={setPriority.isPending}><ChevronDown /></Button><Button size="icon" variant="ghost" className="text-destructive hover:bg-destructive/10 hover:text-destructive" title={!credential.disabled ? '需要先禁用凭据才能删除' : '删除凭据'} aria-label={`删除凭据 ${credential.id}`} onClick={() => setShowDeleteDialog(true)} disabled={!credential.disabled}><Trash2 /></Button></>}</div></div>
+          <div className="mt-auto pt-5"><div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => onViewBalance(credential.id)}><Wallet />查看额度</Button>{credential.canManage && archived && <Button size="sm" variant="ghost" onClick={handleUnarchive} disabled={unarchiveCredential.isPending}><ArchiveRestore />恢复</Button>}{canPurge && archived && <Button size="sm" variant="ghost" className="text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => setShowPurgeDialog(true)} disabled={purgeCredential.isPending}><Trash2 />彻底删除</Button>}{credential.canManage && !archived && <><Button size="sm" variant="ghost" onClick={handleForceRefresh} disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'} title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token'}><RefreshCw className={forceRefresh.isPending ? 'animate-spin' : ''} />刷新 Token</Button><Button size="icon" variant="ghost" title="重置失败次数" aria-label={`重置凭据 ${credential.id} 的失败次数`} onClick={handleReset} disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}><RotateCcwIcon /></Button><Button size="icon" variant="ghost" title="提高优先级" aria-label={`提高凭据 ${credential.id} 的优先级`} onClick={() => changePriority(Math.max(0, credential.priority - 1))} disabled={setPriority.isPending || credential.priority === 0}><ChevronUp /></Button><Button size="icon" variant="ghost" title="降低优先级" aria-label={`降低凭据 ${credential.id} 的优先级`} onClick={() => changePriority(credential.priority + 1)} disabled={setPriority.isPending}><ChevronDown /></Button><Button size="icon" variant="ghost" title="改绑代理" aria-label={`改绑凭据 ${credential.id} 的代理`} onClick={() => setShowProxyDialog(true)}><Globe /></Button><Button size="icon" variant="ghost" title="归档凭据" aria-label={`归档凭据 ${credential.id}`} onClick={() => setShowArchiveDialog(true)}><Archive /></Button></>}</div></div>
         </CardContent>
       </Card>
 
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}><DialogContent><DialogHeader><DialogTitle>确认删除凭据</DialogTitle><DialogDescription>确定要删除凭据 #{credential.id} 吗？此操作无法撤销。</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setShowDeleteDialog(false)} disabled={deleteCredential.isPending}>取消</Button><Button variant="destructive" onClick={handleDelete} disabled={deleteCredential.isPending || !credential.disabled}>确认删除</Button></DialogFooter></DialogContent></Dialog>
+      <ArchiveCredentialDialog credentialId={credential.id} open={showArchiveDialog} onOpenChange={setShowArchiveDialog} onConfirm={handleArchive} pending={archiveCredential.isPending} />
+      {canPurge && archived && <PurgeCredentialDialog credentialId={credential.id} open={showPurgeDialog} onOpenChange={setShowPurgeDialog} onConfirm={handlePurge} pending={purgeCredential.isPending} />}
+      {credential.canManage && !archived && <ProxyBindingDialog credential={credential} open={showProxyDialog} onOpenChange={setShowProxyDialog} />}
     </>
   )
 }

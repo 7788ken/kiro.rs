@@ -2,9 +2,10 @@
 
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
+use serde::Deserialize;
 
 use super::core_config;
 use crate::accounts::AuthUser;
@@ -12,18 +13,31 @@ use crate::accounts::AuthUser;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, ArchiveCredentialRequest, SetCredentialProxyRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetProxyEnabledRequest, SuccessResponse,
     },
 };
+use crate::proxy_pool::ProxyInput;
 
-/// GET /api/admin/credentials
+/// 凭据列表查询参数
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsQuery {
+    /// 是否包含已归档凭据（默认 false）
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// GET /api/admin/credentials?includeArchived=true
 /// 获取所有凭据状态
 pub async fn get_all_credentials(
     State(state): State<AdminState>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<CredentialsQuery>,
 ) -> impl IntoResponse {
-    let response = state.service.get_all_credentials(&user);
+    let response = state
+        .service
+        .get_all_credentials(&user, query.include_archived);
     match response {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -107,15 +121,47 @@ pub async fn add_credential(
     }
 }
 
-/// DELETE /api/admin/credentials/:id
-/// 删除凭据
-pub async fn delete_credential(
+/// POST /api/admin/credentials/:id/archive
+/// 归档凭据（请求体可选：`{"reason": "..."}`）
+pub async fn archive_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
+    payload: Option<Json<ArchiveCredentialRequest>>,
+) -> impl IntoResponse {
+    let req = payload.map(|Json(req)| req).unwrap_or_default();
+    match state.service.archive_credential(&user, id, req) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已归档", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/unarchive
+/// 恢复已归档凭据（恢复后仍为禁用状态）
+pub async fn unarchive_credential(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
     Extension(user): Extension<AuthUser>,
 ) -> impl IntoResponse {
-    match state.service.delete_credential(&user, id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
+    match state.service.unarchive_credential(&user, id) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 已恢复，仍处于禁用状态",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/credentials/:id
+/// 彻底删除已归档凭据（仅超级管理员）
+pub async fn purge_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
+) -> impl IntoResponse {
+    match state.service.purge_credential(&user, id) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已彻底删除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -195,4 +241,97 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// PUT /api/admin/credentials/:id/proxy
+/// 修改凭据代理绑定：`{ proxyId }` / `{ direct: true }` / `{ clear: true }` 三选一
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Extension(user): Extension<AuthUser>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(&user, id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理绑定已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/check-egress
+/// 用凭据实际使用的代理检测一次出口 IP（不写入代理池健康状态）
+pub async fn check_credential_egress(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.check_credential_egress(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxies
+pub async fn list_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_proxies())
+}
+
+/// POST /api/admin/proxies
+pub async fn add_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyInput>,
+) -> impl IntoResponse {
+    match state.service.add_proxy(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxies/:id
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ProxyInput>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxies/:id
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.remove_proxy(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已删除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/:id/enabled
+pub async fn set_proxy_enabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetProxyEnabledRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_enabled(id, payload.enabled) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/:id/check
+pub async fn check_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.check_proxy(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/check-all
+pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.check_all_proxies().await)
 }

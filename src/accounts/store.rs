@@ -97,7 +97,8 @@ impl AccountStore {
                 error_message TEXT,
                 duration_ms INTEGER,
                 first_token_ms INTEGER,
-                consumption_ratio REAL NOT NULL DEFAULT 1.0
+                consumption_ratio REAL NOT NULL DEFAULT 1.0,
+                credential_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_transactions_user ON credit_transactions(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_transactions_pending ON credit_transactions(status) WHERE status = 'pending';
@@ -127,6 +128,7 @@ impl AccountStore {
             ("error_message", "TEXT"),
             ("duration_ms", "INTEGER"),
             ("first_token_ms", "INTEGER"),
+            ("credential_id", "INTEGER"),
         ] {
             ensure_column(&connection, "credit_transactions", column, definition)?;
         }
@@ -615,7 +617,8 @@ impl AccountStore {
         let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model,
                    t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at,
                    t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro,
-                   COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms
+                   COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms,
+                   t.credential_id
                    FROM credit_transactions t JOIN users u ON u.id = t.user_id
                    LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge')
                    WHERE t.kind IN ('reserve', 'charge', 'error') ";
@@ -783,6 +786,7 @@ impl AccountStore {
         input_tokens: i64,
         output_tokens: i64,
         credential_credits: Option<f64>,
+        credential_id: Option<u64>,
         log: Option<&RequestLog>,
     ) -> Result<(), AccountError> {
         let connection = self.connection.lock();
@@ -839,8 +843,8 @@ impl AccountStore {
         let balance_before_micro = reserved_balance_micro
             .map(|balance_after_reservation| balance_after_reservation + reservation.amount_micro);
         transaction.execute(
-            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15, note = ?16 WHERE id = ?17",
-            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), charge_note, reservation.id],
+            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15, note = ?16, credential_id = ?17 WHERE id = ?18",
+            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), charge_note, credential_id.map(|id| id as i64), reservation.id],
         )?;
         insert_transaction(
             &transaction,
@@ -858,7 +862,7 @@ impl AccountStore {
     }
 
     pub fn refund(&self, reservation: &Reservation, log: Option<&RequestLog>) {
-        if let Err(error) = self.settle(reservation, false, 0, 0, None, log) {
+        if let Err(error) = self.settle(reservation, false, 0, 0, None, None, log) {
             tracing::error!(reservation = %reservation.id, "释放预授权积分失败: {}", error);
         }
     }
@@ -1096,6 +1100,7 @@ fn transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransactionView>
         error_message: row.get(21)?,
         duration_ms: row.get(22)?,
         first_token_ms: row.get(23)?,
+        credential_id: row.get::<_, Option<i64>>(24)?.map(|id| id as u64),
     })
 }
 
@@ -1247,14 +1252,14 @@ mod tests {
             9_940_000
         );
         store
-            .settle(&reservation, true, 100, 100, Some(0.006), None)
+            .settle(&reservation, true, 100, 100, Some(0.006), None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
         );
         store
-            .settle(&reservation, true, 1000, 1000, Some(9.0), None)
+            .settle(&reservation, true, 1000, 1000, Some(9.0), None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
@@ -1285,7 +1290,7 @@ mod tests {
         let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
         assert_eq!(reservation.amount_micro, 60_000);
         store
-            .settle(&reservation, true, 100, 100, None, None)
+            .settle(&reservation, true, 100, 100, None, None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
@@ -1298,7 +1303,7 @@ mod tests {
 
         let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
         store
-            .settle(&reservation, true, 1, 1, Some(0.25), None)
+            .settle(&reservation, true, 1, 1, Some(0.25), None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
@@ -1310,7 +1315,7 @@ mod tests {
 
         let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
         store
-            .settle(&reservation, true, 1, 1, Some(5.0), None)
+            .settle(&reservation, true, 1, 1, Some(5.0), None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
@@ -1325,6 +1330,29 @@ mod tests {
                 .unwrap()
                 .contains("可用余额不足")
         );
+    }
+
+    #[test]
+    fn settlement_records_credential_id() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 1.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        store
+            .settle(&reservation, true, 1, 1, Some(0.25), Some(7), None)
+            .unwrap();
+        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(charged.credential_id, Some(7));
+        // 凭证 ID 只记录，不影响结算金额
+        assert_eq!(charged.amount_micro, -250_000);
+
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        store.refund(&reservation, None);
+        let released = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(released.credential_id, None);
     }
 
     #[test]
@@ -1349,7 +1377,7 @@ mod tests {
         billing.consumption_ratio = 9.0;
         store.set_billing_config(&billing).unwrap();
         store
-            .settle(&reservation, true, 1, 1, Some(1.0), None)
+            .settle(&reservation, true, 1, 1, Some(1.0), None, None)
             .unwrap();
         assert_eq!(
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
@@ -1418,7 +1446,7 @@ mod tests {
             let user = store.authenticate_key(key).unwrap().unwrap();
             let reservation = store.reserve(&user, model, 1000, 1000).unwrap().unwrap();
             store
-                .settle(&reservation, true, 100, 100, Some(0.006), None)
+                .settle(&reservation, true, 100, 100, Some(0.006), None, None)
                 .unwrap();
             store
                 .connection

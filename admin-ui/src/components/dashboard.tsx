@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Search, LayoutGrid, List } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Archive, RotateCcw, CheckCircle2, Search, LayoutGrid, List } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent } from '@/components/ui/card'
@@ -11,7 +11,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useArchiveCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -47,15 +47,19 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all')
   const [ownerFilter, setOwnerFilter] = useState<'all' | 'manageable' | 'readonly'>('all')
+  const [archiveView, setArchiveView] = useState<'active' | 'archived'>('active')
+  const showArchived = archiveView === 'archived'
   const itemsPerPage = 12
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentials()
-  const { mutate: deleteCredential } = useDeleteCredential()
+  const { data, isLoading, error, refetch } = useCredentials(showArchived)
+  const { mutate: archiveCredential } = useArchiveCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
-  const filteredCredentials = (data?.credentials || []).filter(credential => {
+  // 常规视图只显示未归档项，已归档视图只显示已归档项
+  const viewCredentials = (data?.credentials || []).filter(credential => credential.archived === showArchived)
+  const filteredCredentials = viewCredentials.filter(credential => {
     const keyword = search.trim().toLocaleLowerCase()
     const matchesKeyword = !keyword || [credential.id.toString(), credential.email, credential.endpoint, credential.registeredByName, credential.maskedApiKey, credential.authMethod]
       .some(value => value?.toLocaleLowerCase().includes(keyword))
@@ -66,19 +70,15 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
   const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const currentCredentials = filteredCredentials.slice(startIndex, startIndex + itemsPerPage)
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.canManage && credential.disabled).length || 0
-  const manageableCount = data?.credentials.filter(credential => credential.canManage).length || 0
-  const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
-    return Boolean(credential?.disabled)
-  }).length
+  const disabledCredentialCount = viewCredentials.filter(credential => credential.canManage && credential.disabled).length
+  const manageableCount = viewCredentials.filter(credential => credential.canManage).length
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length, search, statusFilter, ownerFilter])
+  }, [data?.credentials.length, search, statusFilter, ownerFilter, archiveView])
 
-  // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
+  // 只保留当前列表中仍存在的凭据缓存，避免归档或切换视图后残留旧数据
   useEffect(() => {
     if (!data?.credentials) {
       setBalanceMap(new Map())
@@ -105,7 +105,10 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
       })
       return next
     })
-    setSelectedIds(previous => new Set(Array.from(previous).filter(id => data.credentials.find(credential => credential.id === id)?.canManage)))
+    setSelectedIds(previous => new Set(Array.from(previous).filter(id => {
+      const credential = data.credentials.find(item => item.id === id)
+      return Boolean(credential?.canManage && !credential.archived)
+    })))
   }, [data?.credentials])
 
   const handleViewBalance = (id: number) => {
@@ -125,7 +128,8 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
 
   // 选择管理
   const toggleSelect = (id: number) => {
-    if (!data?.credentials.find(credential => credential.id === id)?.canManage) return
+    const credential = data?.credentials.find(item => item.id === id)
+    if (!credential?.canManage || credential.archived) return
     const newSelected = new Set(selectedIds)
     if (newSelected.has(id)) {
       newSelected.delete(id)
@@ -139,37 +143,14 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
     setSelectedIds(new Set())
   }
 
-  // 批量删除（仅删除已禁用项）
-  const handleBatchDelete = async () => {
-    if (selectedIds.size === 0) {
-      toast.error('请先选择要删除的凭据')
-      return
-    }
-
-    const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.canManage && credential.disabled)
-    })
-
-    if (disabledIds.length === 0) {
-      toast.error('选中的凭据中没有已禁用项')
-      return
-    }
-
-    const skippedCount = selectedIds.size - disabledIds.length
-    const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
-
-    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
-      return
-    }
-
+  // 依次归档指定凭据，返回成功/失败数
+  const archiveMany = async (ids: number[]) => {
     let successCount = 0
     let failCount = 0
-
-    for (const id of disabledIds) {
+    for (const id of ids) {
       try {
         await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
+          archiveCredential({ id }, {
             onSuccess: () => {
               successCount++
               resolve()
@@ -184,13 +165,31 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
         // 错误已在 onError 中处理
       }
     }
+    return { successCount, failCount }
+  }
 
-    const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
+  // 批量归档
+  const handleBatchArchive = async () => {
+    const ids = Array.from(selectedIds).filter(id => {
+      const credential = data?.credentials.find(c => c.id === id)
+      return Boolean(credential?.canManage && !credential.archived)
+    })
+
+    if (ids.length === 0) {
+      toast.error('请先选择要归档的凭据')
+      return
+    }
+
+    if (!confirm(`确定要归档 ${ids.length} 个凭据吗？归档后停止参与调度并从常规列表隐藏，统计数据保留，可随时恢复。`)) {
+      return
+    }
+
+    const { successCount, failCount } = await archiveMany(ids)
 
     if (failCount === 0) {
-      toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
+      toast.success(`成功归档 ${successCount} 个凭据`)
     } else {
-      toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
+      toast.warning(`归档凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
     }
 
     deselectAll()
@@ -289,50 +288,25 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
     deselectAll()
   }
 
-  // 一键清除所有已禁用凭据
-  const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
-      toast.error('没有可清除的凭据')
-      return
-    }
-
-    const disabledCredentials = data.credentials.filter(credential => credential.canManage && credential.disabled)
+  // 一键归档所有已禁用凭据
+  const handleArchiveAllDisabled = async () => {
+    const disabledCredentials = viewCredentials.filter(credential => credential.canManage && credential.disabled)
 
     if (disabledCredentials.length === 0) {
-      toast.error('没有可清除的已禁用凭据')
+      toast.error('没有可归档的已禁用凭据')
       return
     }
 
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
+    if (!confirm(`确定要归档所有 ${disabledCredentials.length} 个已禁用凭据吗？统计数据保留，可随时恢复。`)) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const credential of disabledCredentials) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
-    }
+    const { successCount, failCount } = await archiveMany(disabledCredentials.map(credential => credential.id))
 
     if (failCount === 0) {
-      toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
+      toast.success(`成功归档 ${successCount} 个已禁用凭据`)
     } else {
-      toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
+      toast.warning(`归档已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
     }
 
     deselectAll()
@@ -548,7 +522,7 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
         </div>
         <p className="text-xs tabular-nums text-muted-foreground">找到 {filteredCredentials.length} 个凭证 · 当前分支可管理 {manageableCount} 个</p>
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-sm font-medium">卡片 / 列表</p>
+          <div className="flex rounded-lg bg-muted p-1" role="group" aria-label="凭据范围"><Button variant={!showArchived ? 'outline' : 'ghost'} size="sm" aria-pressed={!showArchived} onClick={() => { setArchiveView('active'); deselectAll() }}>常规</Button><Button variant={showArchived ? 'outline' : 'ghost'} size="sm" aria-pressed={showArchived} onClick={() => { setArchiveView('archived'); deselectAll() }}><Archive />已归档</Button></div>
           <div className="flex rounded-lg bg-muted p-1" role="group" aria-label="凭据视图"><Button variant={viewMode === 'card' ? 'outline' : 'ghost'} size="sm" aria-pressed={viewMode === 'card'} onClick={() => { setViewMode('card'); localStorage.setItem('kiro-credential-view', 'card') }}><LayoutGrid />卡片</Button><Button variant={viewMode === 'list' ? 'outline' : 'ghost'} size="sm" aria-pressed={viewMode === 'list'} onClick={() => { setViewMode('list'); localStorage.setItem('kiro-credential-view', 'list') }}><List />列表</Button></div>
         </div>
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
@@ -558,23 +532,25 @@ export function Dashboard({ onLogout, isSuperAdmin }: DashboardProps) {
             <Button size="sm" onClick={() => setAddDialogOpen(true)}><Plus />添加凭据</Button>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {data?.credentials && data.credentials.length > 0 && <Button onClick={handleQueryCurrentPageInfo} size="sm" variant="outline" disabled={queryingInfo}><RefreshCw className={queryingInfo ? 'animate-spin' : ''} />{queryingInfo ? `查询 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页信息'}</Button>}
-            {data?.credentials && data.credentials.length > 0 && <Button onClick={handleClearAll} size="sm" variant="ghost" className="text-destructive hover:text-destructive" disabled={disabledCredentialCount === 0} title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}><Trash2 />清除已禁用</Button>}
+            {!showArchived && viewCredentials.length > 0 && <Button onClick={handleQueryCurrentPageInfo} size="sm" variant="outline" disabled={queryingInfo}><RefreshCw className={queryingInfo ? 'animate-spin' : ''} />{queryingInfo ? `查询 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页信息'}</Button>}
+            {!showArchived && viewCredentials.length > 0 && <Button onClick={handleArchiveAllDisabled} size="sm" variant="ghost" disabled={disabledCredentialCount === 0} title={disabledCredentialCount === 0 ? '没有可归档的已禁用凭据' : undefined}><Archive />归档已禁用</Button>}
           </div>
         </div>
 
-        {selectedIds.size > 0 && <div className="flex flex-col gap-3 rounded-xl border border-primary/15 bg-primary/[0.04] p-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-3 px-1"><Badge>已选择 {selectedIds.size} 个</Badge><button className="min-h-10 text-xs text-muted-foreground hover:text-foreground" onClick={deselectAll}>取消选择</button></div><div className="flex flex-wrap gap-2"><Button onClick={handleBatchVerify} size="sm" variant="outline"><CheckCircle2 />批量验活</Button><Button onClick={handleBatchForceRefresh} size="sm" variant="outline" disabled={batchRefreshing}><RefreshCw className={batchRefreshing ? 'animate-spin' : ''} />{batchRefreshing ? `刷新 ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新'}</Button><Button onClick={handleBatchResetFailure} size="sm" variant="outline"><RotateCcw />恢复异常</Button><Button onClick={handleBatchDelete} size="sm" variant="destructive" disabled={selectedDisabledCount === 0} title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}><Trash2 />删除</Button></div></div>}
+        {!showArchived && selectedIds.size > 0 && <div className="flex flex-col gap-3 rounded-xl border border-primary/15 bg-primary/[0.04] p-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-3 px-1"><Badge>已选择 {selectedIds.size} 个</Badge><button className="min-h-10 text-xs text-muted-foreground hover:text-foreground" onClick={deselectAll}>取消选择</button></div><div className="flex flex-wrap gap-2"><Button onClick={handleBatchVerify} size="sm" variant="outline"><CheckCircle2 />批量验活</Button><Button onClick={handleBatchForceRefresh} size="sm" variant="outline" disabled={batchRefreshing}><RefreshCw className={batchRefreshing ? 'animate-spin' : ''} />{batchRefreshing ? `刷新 ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新'}</Button><Button onClick={handleBatchResetFailure} size="sm" variant="outline"><RotateCcw />恢复异常</Button><Button onClick={handleBatchArchive} size="sm" variant="outline"><Archive />归档</Button></div></div>}
         {verifying && !verifyDialogOpen && <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary"><CheckCircle2 className="animate-spin" />验活中 {verifyProgress.current}/{verifyProgress.total}</Button>}
 
-        {data?.credentials.length === 0 ? (
+        {showArchived && viewCredentials.length === 0 ? (
+          <Card><CardContent className="p-0"><EmptyState icon={Archive} title="没有已归档的凭据" description="归档的凭据会出现在这里，可随时恢复。" /></CardContent></Card>
+        ) : viewCredentials.length === 0 ? (
           <Card><CardContent className="p-0"><EmptyState icon={Server} title="还没有上游凭据" description="添加 Kiro OAuth 或 API Key 凭据，建立可供用户请求使用的连接池。" action={<Button onClick={() => setAddDialogOpen(true)}><Plus />添加第一个凭据</Button>} /></CardContent></Card>
         ) : filteredCredentials.length === 0 ? (
           <Card><CardContent className="p-0"><EmptyState icon={Search} title="没有匹配的凭证" description="尝试更换关键词、状态或归属筛选条件。" action={<Button variant="outline" onClick={() => { setSearch(''); setStatusFilter('all'); setOwnerFilter('all') }}>清除筛选</Button>} /></CardContent></Card>
         ) : (
           <>
             {viewMode === 'card' ? <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-              {currentCredentials.map(credential => <CredentialCard key={credential.id} credential={credential} onViewBalance={handleViewBalance} selected={selectedIds.has(credential.id)} onToggleSelect={() => toggleSelect(credential.id)} balance={balanceMap.get(credential.id) || null} loadingBalance={loadingBalanceIds.has(credential.id)} />)}
-            </div> : <CredentialList credentials={currentCredentials} onViewBalance={handleViewBalance} selectedIds={selectedIds} onToggleSelect={toggleSelect} balanceMap={balanceMap} loadingBalanceIds={loadingBalanceIds} />}
+              {currentCredentials.map(credential => <CredentialCard key={credential.id} credential={credential} onViewBalance={handleViewBalance} selected={selectedIds.has(credential.id)} onToggleSelect={() => toggleSelect(credential.id)} balance={balanceMap.get(credential.id) || null} loadingBalance={loadingBalanceIds.has(credential.id)} canPurge={isSuperAdmin && showArchived} />)}
+            </div> : <CredentialList credentials={currentCredentials} onViewBalance={handleViewBalance} selectedIds={selectedIds} onToggleSelect={toggleSelect} balanceMap={balanceMap} loadingBalanceIds={loadingBalanceIds} canPurge={isSuperAdmin && showArchived} />}
             {totalPages > 1 && <div className="flex flex-wrap items-center justify-center gap-3 pt-2"><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}>上一页</Button><span className="text-sm text-muted-foreground tabular-nums">第 {currentPage} / {totalPages} 页 · 共 {filteredCredentials.length} 个</span><Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>下一页</Button></div>}
           </>
         )}

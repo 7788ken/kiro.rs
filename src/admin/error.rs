@@ -23,6 +23,12 @@ pub enum AdminServiceError {
 
     /// 当前管理员不能管理该凭据或配置
     Forbidden(String),
+
+    /// 出口代理不存在
+    ProxyNotFound { id: u64 },
+
+    /// 请求参数无效（原样展示消息）
+    InvalidRequest(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -35,6 +41,8 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::Forbidden(msg) => write!(f, "{}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::ProxyNotFound { id } => write!(f, "代理不存在: {}", id),
+            AdminServiceError::InvalidRequest(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -50,6 +58,8 @@ impl AdminServiceError {
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
             AdminServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AdminServiceError::ProxyNotFound { .. } => StatusCode::NOT_FOUND,
+            AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -66,6 +76,12 @@ impl AdminServiceError {
             }
             AdminServiceError::Forbidden(_) => {
                 AdminErrorResponse::new("forbidden", self.to_string())
+            }
+            AdminServiceError::ProxyNotFound { .. } => {
+                AdminErrorResponse::not_found(self.to_string())
+            }
+            AdminServiceError::InvalidRequest(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
             }
         }
     }

@@ -24,6 +24,35 @@ pub fn migrate(sqlite_path: &str, mysql_url: &str) -> Result<(), String> {
     result
 }
 
+const TRANSACTION_COLUMNS: &[&str] = &[
+    "id",
+    "user_id",
+    "actor_id",
+    "kind",
+    "amount_micro",
+    "balance_after_micro",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "reserved_micro",
+    "input_rate",
+    "output_rate",
+    "status",
+    "note",
+    "created_at",
+    "completed_at",
+    "request_id",
+    "path",
+    "stream",
+    "balance_before_micro",
+    "reserved_balance_micro",
+    "http_status",
+    "error_message",
+    "duration_ms",
+    "first_token_ms",
+    "credential_id",
+];
+
 fn migrate_inner(sqlite: &Connection, mysql: &mut Conn) -> Result<(), String> {
     let users = read_users(sqlite)?;
     let billing = read_rows(
@@ -77,33 +106,7 @@ fn migrate_inner(sqlite: &Connection, mysql: &mut Conn) -> Result<(), String> {
                 "parent_id",
             ],
             "billing_config" => &["id", "input_per_million", "output_per_million"],
-            "credit_transactions" => &[
-                "id",
-                "user_id",
-                "actor_id",
-                "kind",
-                "amount_micro",
-                "balance_after_micro",
-                "model",
-                "input_tokens",
-                "output_tokens",
-                "reserved_micro",
-                "input_rate",
-                "output_rate",
-                "status",
-                "note",
-                "created_at",
-                "completed_at",
-                "request_id",
-                "path",
-                "stream",
-                "balance_before_micro",
-                "reserved_balance_micro",
-                "http_status",
-                "error_message",
-                "duration_ms",
-                "first_token_ms",
-            ],
+            "credit_transactions" => TRANSACTION_COLUMNS,
             _ => &["token_hash", "user_id", "expires_at"],
         };
         for row in rows {
@@ -212,13 +215,30 @@ fn read_users(connection: &Connection) -> Result<Rows, String> {
 }
 
 fn read_transactions(connection: &Connection) -> Result<Rows, String> {
-    let mut statement = connection.prepare("SELECT id,user_id,actor_id,kind,amount_micro,balance_after_micro,model,input_tokens,output_tokens,reserved_micro,input_rate,output_rate,status,note,created_at,completed_at FROM credit_transactions").map_err(|e| e.to_string())?;
+    let has_credential_id = connection
+        .prepare("PRAGMA table_info(credit_transactions)")
+        .map_err(|e| e.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .contains(&"credential_id".to_string());
+    let credential_column = if has_credential_id {
+        "credential_id"
+    } else {
+        "NULL"
+    };
+    let mut statement = connection.prepare(&format!("SELECT id,user_id,actor_id,kind,amount_micro,balance_after_micro,model,input_tokens,output_tokens,reserved_micro,input_rate,output_rate,status,note,created_at,completed_at,{credential_column} FROM credit_transactions")).map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |row| {
             let mut values = (0..16)
                 .map(|i| row.get::<_, rusqlite::types::Value>(i))
                 .collect::<Result<Vec<_>, _>>()?;
             values.extend((0..9).map(|_| rusqlite::types::Value::Null));
+            values.push(match row.get::<_, Option<i64>>(16)? {
+                Some(id) => rusqlite::types::Value::Integer(id),
+                None => rusqlite::types::Value::Null,
+            });
             Ok(values)
         })
         .map_err(|e| e.to_string())?;
@@ -251,5 +271,50 @@ fn int(value: &rusqlite::types::Value) -> i64 {
     match value {
         rusqlite::types::Value::Integer(value) => *value,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_TABLE: &str = "CREATE TABLE credit_transactions (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, actor_id INTEGER, kind TEXT NOT NULL, amount_micro INTEGER NOT NULL, balance_after_micro INTEGER NOT NULL, model TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reserved_micro INTEGER NOT NULL DEFAULT 0, input_rate REAL NOT NULL DEFAULT 10.0, output_rate REAL NOT NULL DEFAULT 50.0, status TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL, completed_at TEXT)";
+    const INSERT: &str = "INSERT INTO credit_transactions (id, user_id, kind, amount_micro, balance_after_micro, status, created_at) VALUES ('t1', 1, 'charge', -10, 90, 'settled', '2026-01-01')";
+
+    fn credential_value(rows: &Rows) -> &rusqlite::types::Value {
+        let index = TRANSACTION_COLUMNS
+            .iter()
+            .position(|column| *column == "credential_id")
+            .unwrap();
+        &rows[0][index]
+    }
+
+    #[test]
+    fn read_transactions_carries_credential_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute(LEGACY_TABLE, []).unwrap();
+        connection
+            .execute(
+                "ALTER TABLE credit_transactions ADD COLUMN credential_id INTEGER",
+                [],
+            )
+            .unwrap();
+        connection.execute(INSERT, []).unwrap();
+        connection
+            .execute("UPDATE credit_transactions SET credential_id = 7", [])
+            .unwrap();
+        let rows = read_transactions(&connection).unwrap();
+        assert_eq!(rows[0].len(), TRANSACTION_COLUMNS.len());
+        assert_eq!(credential_value(&rows), &rusqlite::types::Value::Integer(7));
+    }
+
+    #[test]
+    fn read_transactions_fills_null_without_credential_column() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute(LEGACY_TABLE, []).unwrap();
+        connection.execute(INSERT, []).unwrap();
+        let rows = read_transactions(&connection).unwrap();
+        assert_eq!(rows[0].len(), TRANSACTION_COLUMNS.len());
+        assert_eq!(credential_value(&rows), &rusqlite::types::Value::Null);
     }
 }

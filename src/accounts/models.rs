@@ -144,6 +144,8 @@ pub struct TransactionView {
     pub error_message: Option<String>,
     pub duration_ms: Option<i64>,
     pub first_token_ms: Option<i64>,
+    /// 本次请求使用的上游凭证 ID（旧记录为空）
+    pub credential_id: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -339,6 +341,8 @@ pub fn settlement_notes(
 #[derive(Clone, Debug, Default)]
 pub struct CredentialUsage {
     credits: Arc<Mutex<Option<f64>>>,
+    /// 本次请求最终成功响应所用的凭证 ID（重试换凭证时以最后成功的为准）
+    credential_id: Arc<Mutex<Option<u64>>>,
 }
 
 impl CredentialUsage {
@@ -356,6 +360,15 @@ impl CredentialUsage {
 
     pub fn get(&self) -> Option<f64> {
         *self.credits.lock()
+    }
+
+    /// 记录本次请求使用的凭证 ID。后写入的覆盖先前的值。
+    pub fn set_credential_id(&self, id: u64) {
+        *self.credential_id.lock() = Some(id);
+    }
+
+    pub fn credential_id(&self) -> Option<u64> {
+        *self.credential_id.lock()
     }
 }
 

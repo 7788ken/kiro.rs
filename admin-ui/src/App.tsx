@@ -8,6 +8,7 @@ import { Dashboard } from '@/components/dashboard'
 import { AccountDashboard } from '@/components/account-dashboard'
 import { MonitorPanel } from '@/components/monitor-panel'
 import { UsagePanel } from '@/components/usage-panel'
+import { ProxiesPanel } from '@/components/proxies-panel'
 import { AdminShell, type AdminSection } from '@/components/admin-shell'
 import { Toaster } from '@/components/ui/sonner'
 import { navigateTo, replaceLocation, sectionPath, useAdminSection } from '@/lib/navigation'
@@ -68,7 +69,7 @@ function App() {
   }
 
   const role = accountQuery.data?.user.role || account?.user.role
-  const accessible = section && (role !== 'user' || !['credentials', 'monitor', 'users'].includes(section))
+  const accessible = section && (role !== 'user' || !['credentials', 'proxies', 'monitor', 'users'].includes(section))
 
   useEffect(() => {
     if (section && role && !accessible) navigateTo(sectionPath('overview'), true)
@@ -88,6 +89,8 @@ function App() {
             <MonitorPanel />
           ) : section === 'credentials' ? (
             <Dashboard onLogout={logout} isSuperAdmin={role === 'super_admin'} />
+          ) : section === 'proxies' ? (
+            <ProxiesPanel />
           ) : section === 'users' ? (
             <AccountDashboard initialAccount={account} section={section} onSectionChange={next => navigateTo(sectionPath(next))} onLogout={logout} />
           ) : section === 'usage' ? (

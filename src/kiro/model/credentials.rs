@@ -93,6 +93,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 绑定的出口代理池条目 ID（可选，见 `proxy_pool`）
+    /// 优先级低于 `proxyUrl = "direct"`，高于凭据直填代理和全局代理
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -117,11 +122,32 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 是否已归档（归档后不参与调度、不出现在常规列表，数据保留，可恢复）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+
+    /// 归档时间（RFC3339）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+
+    /// 执行归档的管理员账户 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<i64>,
+
+    /// 归档原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// 判断是否为 false（用于跳过序列化）
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {
@@ -587,6 +613,43 @@ mod tests {
         assert_eq!(creds.client_secret, Some("secret456".to_string()));
         assert_eq!(creds.priority, 5);
         assert_eq!(creds.region, Some("ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_credentials_without_archive_fields() {
+        let json = r#"[{"id": 1, "refreshToken": "refresh", "disabled": true}]"#;
+        let creds: Vec<KiroCredentials> = serde_json::from_str(json).unwrap();
+        assert!(!creds[0].archived);
+        assert!(creds[0].archived_at.is_none());
+        assert!(creds[0].archived_by.is_none());
+        assert!(creds[0].archive_reason.is_none());
+
+        // 未归档时不写出归档字段，保持旧文件格式
+        let out = serde_json::to_string(&creds[0]).unwrap();
+        assert!(!out.contains("archived"));
+        assert!(!out.contains("archiveReason"));
+    }
+
+    #[test]
+    fn test_archive_fields_roundtrip() {
+        let original = KiroCredentials {
+            id: Some(3),
+            disabled: true,
+            archived: true,
+            archived_at: Some("2026-01-01T00:00:00Z".to_string()),
+            archived_by: Some(9),
+            archive_reason: Some("停用".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"archived\":true"));
+        assert!(json.contains("\"archivedAt\""));
+        assert!(json.contains("\"archivedBy\":9"));
+        assert!(json.contains("\"archiveReason\""));
+        let parsed: KiroCredentials = serde_json::from_str(&json).unwrap();
+        assert!(parsed.archived);
+        assert_eq!(parsed.archived_by, Some(9));
+        assert_eq!(parsed.archive_reason.as_deref(), Some("停用"));
     }
 
     #[test]
