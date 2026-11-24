@@ -231,6 +231,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_keys_count_tokens_without_billing() {
+        let (app, user_key) = fixture();
+        // count_tokens 请求体没有 max_tokens，不能挂计费中间件，否则会被误拒为 400
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages/count_tokens")
+            .header("x-api-key", &user_key)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = String::from_utf8(
+            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("input_tokens"), "{body}");
+    }
+
+    #[tokio::test]
     async fn user_keys_reach_chat_handler() {
         let (app, user_key) = fixture();
         // 测试环境没有 KiroProvider，走到原有 handler 后返回 503，而不是 403

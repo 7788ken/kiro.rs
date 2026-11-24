@@ -40,14 +40,15 @@ pub fn create_router_with_accounts(
 
     let billed_messages = Router::new()
         .route("/messages", post(post_messages))
-        .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             accounts.clone(),
             billing_middleware,
         ));
 
+    // count_tokens 不计费、不走预扣：它没有 max_tokens 字段，挂计费中间件会被误拒
     let v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/messages/count_tokens", post(count_tokens))
         .merge(billed_messages)
         .layer(middleware::from_fn_with_state(
             state.clone(),
