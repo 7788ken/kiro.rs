@@ -1,5 +1,5 @@
 import { api } from '@/api/credentials'
-import type { ProxyInput, ProxyItem, ProxyListResponse, SuccessResponse } from '@/types/api'
+import type { ImportProxiesRequest, ImportProxiesResponse, ProxyInput, ProxyItem, ProxyListResponse, SuccessResponse } from '@/types/api'
 
 // 获取代理池列表（含健康状态与绑定凭据数）
 export async function getProxies(): Promise<ProxyListResponse> {
@@ -10,6 +10,12 @@ export async function getProxies(): Promise<ProxyListResponse> {
 // 新增代理
 export async function addProxy(req: ProxyInput): Promise<ProxyItem> {
   const { data } = await api.post<ProxyItem>('/proxies', req)
+  return data
+}
+
+// 批量导入代理
+export async function importProxies(req: ImportProxiesRequest): Promise<ImportProxiesResponse> {
+  const { data } = await api.post<ImportProxiesResponse>('/proxies/import', req)
   return data
 }
 

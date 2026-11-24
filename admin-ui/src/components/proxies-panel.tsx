@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Globe, Pencil, Plus, RefreshCw, Trash2, Activity } from 'lucide-react'
+import { Globe, Pencil, Plus, RefreshCw, Trash2, Activity, Upload } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,14 +8,10 @@ import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { EmptyState, PageSection, tableCellClass, tableClass, tableHeadClass, tableRowClass } from '@/components/page-elements'
 import { useAddProxy, useCheckAllProxies, useCheckProxy, useDeleteProxy, useProxies, useSetProxyEnabled, useUpdateProxy } from '@/hooks/use-proxies'
+import { ProxyImportDialog } from '@/components/proxy-import-dialog'
+import { proxyStatusMeta as statusMeta } from '@/lib/proxy-status'
 import { extractErrorMessage } from '@/lib/utils'
-import type { ProxyItem, ProxyStatus } from '@/types/api'
-
-const statusMeta: Record<ProxyStatus, { label: string; variant: 'success' | 'destructive' | 'secondary' }> = {
-  healthy: { label: '健康', variant: 'success' },
-  unhealthy: { label: '异常', variant: 'destructive' },
-  unknown: { label: '未知', variant: 'secondary' },
-}
+import type { ProxyItem } from '@/types/api'
 
 function formatTime(value: string | null) {
   if (!value) return '从未检测'
@@ -28,6 +24,7 @@ export function ProxiesPanel() {
   const [editing, setEditing] = useState<ProxyItem | null>(null)
   const [formOpen, setFormOpen] = useState(false)
   const [deleting, setDeleting] = useState<ProxyItem | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
   const proxies = data?.proxies ?? []
 
   const openAdd = () => { setEditing(null); setFormOpen(true) }
@@ -47,12 +44,13 @@ export function ProxiesPanel() {
     actions={<>
       <Button variant="ghost" size="icon" title="刷新列表" aria-label="刷新代理列表" onClick={() => refetch()} disabled={isFetching}><RefreshCw className={isFetching ? 'animate-spin' : ''} /></Button>
       <Button variant="outline" onClick={handleCheckAll} disabled={checkAll.isPending || proxies.length === 0}><Activity className={checkAll.isPending ? 'animate-pulse' : ''} />{checkAll.isPending ? '检测中…' : '全部检测'}</Button>
+      <Button variant="outline" onClick={() => setImportOpen(true)}><Upload />批量导入</Button>
       <Button onClick={openAdd}><Plus />添加代理</Button>
     </>}
   >
     {isLoading ? <div className="rounded-xl border bg-card p-6 text-sm text-muted-foreground">正在加载代理池…</div>
       : isError ? <div className="rounded-xl border bg-card p-6 text-sm text-destructive">代理池加载失败，请刷新重试。</div>
-      : proxies.length === 0 ? <div className="rounded-xl border bg-card"><EmptyState icon={Globe} title="还没有出口代理" description="代理池为空时，新凭据沿用全局代理或直连。添加代理并检测通过后，新凭据会自动绑定。" action={<Button onClick={openAdd}><Plus />添加代理</Button>} /></div>
+      : proxies.length === 0 ? <div className="rounded-xl border bg-card"><EmptyState icon={Globe} title="还没有出口代理" description="代理池为空时，新凭据沿用全局代理或直连。添加代理并检测通过后，新凭据会自动绑定。" action={<div className="flex gap-2"><Button variant="outline" onClick={() => setImportOpen(true)}><Upload />批量导入</Button><Button onClick={openAdd}><Plus />添加代理</Button></div>} /></div>
       : <div className="overflow-x-auto rounded-xl border bg-card"><table className={`${tableClass} min-w-[1080px]`} aria-label="出口代理列表">
         <thead className={tableHeadClass}><tr>
           <th className="px-5 py-3">名称</th><th className="px-3 py-3">地址</th><th className="px-3 py-3">出口 IP</th><th className="px-3 py-3">状态</th><th className="px-3 py-3 text-right">延迟</th><th className="px-3 py-3">最近检测</th><th className="px-3 py-3 text-right">绑定凭据</th><th className="px-3 py-3 text-center">启用</th><th className="px-4 py-3 text-right">操作</th>
@@ -61,6 +59,7 @@ export function ProxiesPanel() {
       </table></div>}
     <ProxyFormDialog open={formOpen} onOpenChange={setFormOpen} proxy={editing} />
     <DeleteProxyDialog proxy={deleting} onOpenChange={open => { if (!open) setDeleting(null) }} />
+    <ProxyImportDialog open={importOpen} onOpenChange={setImportOpen} />
   </PageSection>
 }
 

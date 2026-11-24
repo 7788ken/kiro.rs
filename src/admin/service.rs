@@ -11,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use crate::accounts::{AccountStore, AuthUser, Role};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{MultiTokenManager, ProxyBinding};
-use crate::proxy_pool::{PickError, ProxyInput, ProxyPool, ProxyPoolError};
+use crate::proxy_pool::{
+    BatchLineIssue, IMPORT_SCHEMES, PickError, ProxyInput, ProxyPool, ProxyPoolError,
+    parse_proxy_line,
+};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, ArchiveCredentialRequest, BalanceResponse, CredentialEgressResponse,
-    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse, ProxyItem, ProxyListResponse,
-    SetCredentialProxyRequest, SetLoadBalancingModeRequest,
+    CredentialStatusItem, CredentialsStatusResponse, ImportProxiesRequest, ImportProxiesResponse,
+    LoadBalancingModeResponse, ProxyItem, ProxyListResponse, SetCredentialProxyRequest,
+    SetLoadBalancingModeRequest,
 };
 
 /// 代理池中没有健康代理时添加凭据的错误信息
@@ -480,6 +484,66 @@ impl AdminService {
         self.single_proxy_item(id)
     }
 
+    /// 批量导入代理：逐行解析（空行和 `#` 注释跳过），一次性加入后可选并发检测
+    pub async fn import_proxies(
+        &self,
+        req: ImportProxiesRequest,
+    ) -> Result<ImportProxiesResponse, AdminServiceError> {
+        let default_scheme = req
+            .default_scheme
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "socks5".to_string());
+        if !IMPORT_SCHEMES.contains(&default_scheme.as_str()) {
+            return Err(AdminServiceError::InvalidRequest(
+                "defaultScheme 必须是 http、https、socks5 或 socks5h".into(),
+            ));
+        }
+
+        let lines: Vec<&str> = req.text.lines().collect();
+        let mut inputs = Vec::new();
+        let mut failed = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match parse_proxy_line(line, &default_scheme) {
+                Ok(input) => inputs.push((index + 1, input)),
+                Err(e) => failed.push(BatchLineIssue {
+                    line: index + 1,
+                    reason: e.to_string(),
+                }),
+            }
+        }
+
+        let result = self.proxy_pool.add_batch(inputs);
+        failed.extend(result.failed);
+        failed.sort_by_key(|issue| issue.line);
+
+        let ids: Vec<u64> = result.added.iter().map(|e| e.id).collect();
+        if req.check_after_import.unwrap_or(true) && !ids.is_empty() {
+            self.proxy_pool.check_many(ids).await;
+        }
+        let bound_counts = self.bound_counts();
+        let added = result
+            .added
+            .into_iter()
+            .map(|entry| {
+                let health = self.proxy_pool.health_of(entry.id);
+                self.proxy_item(entry, health, &bound_counts)
+            })
+            .collect();
+
+        Ok(ImportProxiesResponse {
+            added,
+            skipped: result.skipped,
+            failed,
+            total_lines: lines.len(),
+        })
+    }
+
     pub async fn check_all_proxies(&self) -> ProxyListResponse {
         self.proxy_pool.check_all().await;
         self.list_proxies()
@@ -767,7 +831,9 @@ impl AdminService {
 fn map_pool_error(error: ProxyPoolError) -> AdminServiceError {
     match error {
         ProxyPoolError::NotFound(id) => AdminServiceError::ProxyNotFound { id },
-        ProxyPoolError::Invalid(_) | ProxyPoolError::InUse { .. } => {
+        ProxyPoolError::Invalid(_)
+        | ProxyPoolError::InvalidUrl(_)
+        | ProxyPoolError::InUse { .. } => {
             AdminServiceError::InvalidRequest(error.to_string())
         }
         ProxyPoolError::Storage(_) => AdminServiceError::InternalError(error.to_string()),

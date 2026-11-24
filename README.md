@@ -558,6 +558,7 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `POST /api/admin/proxies/:id/enabled` - 启用或停用代理，请求体 `{"enabled": true}`
   - `POST /api/admin/proxies/:id/check` - 检测单个代理
   - `POST /api/admin/proxies/check-all` - 检测全部启用的代理
+  - `POST /api/admin/proxies/import` - 批量导入代理，请求体 `{"text", "defaultScheme"?, "checkAfterImport"?}`。`text` 每行一个代理，空行和 `#` 开头的注释行忽略；支持 `scheme://user:pass@host:port`（用户名密码可 percent-encode）、`scheme://host:port`、`host:port:user:pass`、`host:port`，后两种使用 `defaultScheme`（http/https/socks5/socks5h，默认 socks5）；IPv6 需写成 `[::1]`。名称自动生成为 `host:port`；地址（协议/主机忽略大小写）和用户名与已有代理或同批前面的行相同则跳过。`checkAfterImport` 默认 true，导入后以并发 4 检测新增代理。响应 `{"added": [代理条目，含 health], "skipped": [{"line", "reason"}], "failed": [{"line", "reason"}], "totalLines"}`，不含密码
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

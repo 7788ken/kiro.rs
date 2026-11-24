@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { addProxy, checkAllProxies, checkProxy, deleteProxy, getProxies, setProxyEnabled, updateProxy } from '@/api/proxies'
-import type { ProxyInput } from '@/types/api'
+import { addProxy, checkAllProxies, checkProxy, deleteProxy, getProxies, importProxies, setProxyEnabled, updateProxy } from '@/api/proxies'
+import type { ImportProxiesRequest, ProxyInput } from '@/types/api'
 
 // 查询代理池列表
 export function useProxies(enabled = true) {
@@ -24,6 +24,12 @@ function useInvalidateProxies() {
 export function useAddProxy() {
   const invalidate = useInvalidateProxies()
   return useMutation({ mutationFn: (req: ProxyInput) => addProxy(req), onSuccess: invalidate })
+}
+
+// 批量导入代理
+export function useImportProxies() {
+  const invalidate = useInvalidateProxies()
+  return useMutation({ mutationFn: (req: ImportProxiesRequest) => importProxies(req), onSuccess: invalidate })
 }
 
 // 更新代理

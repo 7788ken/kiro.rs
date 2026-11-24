@@ -116,6 +116,8 @@ pub struct ProxyInput {
 pub enum ProxyPoolError {
     NotFound(u64),
     Invalid(String),
+    /// 批量导入时无法识别的代理行（消息中带脱敏后的原文）
+    InvalidUrl(String),
     InUse { id: u64, bound: usize },
     Storage(String),
 }
@@ -124,7 +126,7 @@ impl fmt::Display for ProxyPoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProxyPoolError::NotFound(id) => write!(f, "代理不存在: {}", id),
-            ProxyPoolError::Invalid(msg) => write!(f, "{}", msg),
+            ProxyPoolError::Invalid(msg) | ProxyPoolError::InvalidUrl(msg) => write!(f, "{}", msg),
             ProxyPoolError::InUse { id, bound } => write!(
                 f,
                 "代理 #{} 仍绑定 {} 个未归档凭据，请先改绑后再删除",
@@ -142,6 +144,23 @@ impl std::error::Error for ProxyPoolError {}
 pub enum PickError {
     /// 池中有启用的代理，但没有健康的
     NoHealthyProxy,
+}
+
+/// 批量导入中被跳过或失败的行
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchLineIssue {
+    /// 原文中的行号（从 1 开始）
+    pub line: usize,
+    pub reason: String,
+}
+
+/// 批量导入结果（`added` 含密码，不要直接序列化给前端）
+#[derive(Debug, Default)]
+pub struct BatchImportResult {
+    pub added: Vec<ProxyEntry>,
+    pub skipped: Vec<BatchLineIssue>,
+    pub failed: Vec<BatchLineIssue>,
 }
 
 /// proxies.json 文件格式
@@ -176,6 +195,9 @@ pub struct ProxyPool {
     health_path: Option<PathBuf>,
     /// 串行化落盘
     write_lock: Mutex<()>,
+    /// 测试用：proxies.json 写入次数
+    #[cfg(test)]
+    entries_persist_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ProxyPool {
@@ -195,6 +217,8 @@ impl ProxyPool {
             proxies_path: None,
             health_path: None,
             write_lock: Mutex::new(()),
+            #[cfg(test)]
+            entries_persist_count: Default::default(),
         }
     }
 
@@ -255,6 +279,8 @@ impl ProxyPool {
             proxies_path: Some(proxies_path),
             health_path: Some(health_path),
             write_lock: Mutex::new(()),
+            #[cfg(test)]
+            entries_persist_count: Default::default(),
         };
         Ok(pool)
     }
@@ -303,28 +329,9 @@ impl ProxyPool {
     // ============ 增删改 ============
 
     pub fn add(&self, input: ProxyInput) -> Result<ProxyEntry, ProxyPoolError> {
-        let name = normalize_name(&input.name)?;
-        let url = validate_proxy_url(&input.url)?;
-        let username = normalize_opt(input.username);
-        let password = if input.clear_password {
-            None
-        } else {
-            normalize_opt(input.password)
-        };
-        validate_auth_pair(&username, &password)?;
-
         let entry = {
             let mut state = self.state.write();
-            let entry = ProxyEntry {
-                id: state.next_id,
-                name,
-                url,
-                username,
-                password,
-                note: normalize_opt(input.note),
-                enabled: input.enabled.unwrap_or(true),
-                created_at: Utc::now().to_rfc3339(),
-            };
+            let entry = build_new_entry(input, state.next_id)?;
             state.next_id += 1;
             state.entries.push(entry.clone());
             entry
@@ -336,6 +343,69 @@ impl ProxyPool {
         }
         tracing::info!("已添加出口代理 #{} ({})", entry.id, entry.name);
         Ok(entry)
+    }
+
+    /// 批量新增代理，成功的条目全部加入后只落盘一次
+    ///
+    /// `inputs` 中的 usize 为原文行号。校验同 [`ProxyPool::add`]；
+    /// URL（scheme/host 忽略大小写）+ 用户名与池中已有条目或本批前面的条目相同则跳过。
+    /// 落盘失败时整批回滚，全部记为失败。
+    pub fn add_batch(&self, inputs: Vec<(usize, ProxyInput)>) -> BatchImportResult {
+        let mut result = BatchImportResult::default();
+        let mut added_lines = Vec::new();
+        {
+            let mut state = self.state.write();
+            let mut seen: HashMap<(String, Option<String>), String> = state
+                .entries
+                .iter()
+                .map(|e| (dedup_key(&e.url, &e.username), format!("已存在 #{}", e.id)))
+                .collect();
+            for (line, input) in inputs {
+                let entry = match build_new_entry(input, state.next_id) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        result.failed.push(BatchLineIssue {
+                            line,
+                            reason: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let key = dedup_key(&entry.url, &entry.username);
+                if let Some(reason) = seen.get(&key) {
+                    result.skipped.push(BatchLineIssue {
+                        line,
+                        reason: reason.clone(),
+                    });
+                    continue;
+                }
+                seen.insert(key, format!("与第 {} 行重复", line));
+                state.next_id += 1;
+                state.entries.push(entry.clone());
+                result.added.push(entry);
+                added_lines.push(line);
+            }
+        }
+        if result.added.is_empty() {
+            return result;
+        }
+        if let Err(e) = self.persist_entries() {
+            let added_ids: Vec<u64> = result.added.iter().map(|e| e.id).collect();
+            self.state
+                .write()
+                .entries
+                .retain(|p| !added_ids.contains(&p.id));
+            let reason = e.to_string();
+            result.added.clear();
+            result.failed.extend(added_lines.into_iter().map(|line| BatchLineIssue {
+                line,
+                reason: reason.clone(),
+            }));
+            result.failed.sort_by_key(|issue| issue.line);
+            return result;
+        }
+        tracing::info!("已批量添加 {} 个出口代理", result.added.len());
+        result
     }
 
     pub fn update(&self, id: u64, input: ProxyInput) -> Result<ProxyEntry, ProxyPoolError> {
@@ -525,6 +595,11 @@ impl ProxyPool {
             .filter(|e| e.enabled)
             .map(|e| e.id)
             .collect();
+        self.check_many(ids).await
+    }
+
+    /// 并发检测指定代理（并发度 4），不存在的 ID 被忽略
+    pub async fn check_many(&self, ids: Vec<u64>) -> Vec<(u64, ProxyHealth)> {
         futures::stream::iter(ids)
             .map(|id| async move { (id, self.check(id).await) })
             .buffer_unordered(CHECK_CONCURRENCY)
@@ -571,6 +646,9 @@ impl ProxyPool {
             return Ok(());
         };
         let _guard = self.write_lock.lock();
+        #[cfg(test)]
+        self.entries_persist_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let json = {
             let state = self.state.read();
             let mut proxies = state.entries.clone();
@@ -683,6 +761,189 @@ fn normalize_name(name: &str) -> Result<String, ProxyPoolError> {
         return Err(ProxyPoolError::Invalid("代理名称不能超过 64 个字符".into()));
     }
     Ok(name.to_string())
+}
+
+/// 校验输入并构造新条目（不写入池、不落盘）
+fn build_new_entry(input: ProxyInput, id: u64) -> Result<ProxyEntry, ProxyPoolError> {
+    let name = normalize_name(&input.name)?;
+    let url = validate_proxy_url(&input.url)?;
+    let username = normalize_opt(input.username);
+    let password = if input.clear_password {
+        None
+    } else {
+        normalize_opt(input.password)
+    };
+    validate_auth_pair(&username, &password)?;
+    Ok(ProxyEntry {
+        id,
+        name,
+        url,
+        username,
+        password,
+        note: normalize_opt(input.note),
+        enabled: input.enabled.unwrap_or(true),
+        created_at: Utc::now().to_rfc3339(),
+    })
+}
+
+/// 去重键：`scheme://host:port`（scheme/host 小写，端口缺省时取协议默认端口）+ 用户名
+fn dedup_key(url: &str, username: &Option<String>) -> (String, Option<String>) {
+    let normalized = match reqwest::Url::parse(url.trim()) {
+        Ok(parsed) => format!(
+            "{}://{}:{}{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or("").to_ascii_lowercase(),
+            parsed
+                .port_or_known_default()
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            parsed.path().trim_end_matches('/')
+        ),
+        Err(_) => url.trim().to_ascii_lowercase(),
+    };
+    (normalized, username.clone())
+}
+
+/// 批量导入行中无协议前缀时允许的默认协议
+pub const IMPORT_SCHEMES: [&str; 4] = ["http", "https", "socks5", "socks5h"];
+/// 无法识别的行在错误信息中保留的最大字符数
+const LINE_PREVIEW_CHARS: usize = 80;
+
+/// 解析批量导入中的一行代理
+///
+/// 支持：
+/// - `scheme://user:pass@host:port`（user/pass 会做 percent-decode）
+/// - `scheme://host:port`
+/// - `host:port:user:pass` / `host:port`（使用 `default_scheme`）
+///
+/// host 可为 IPv4、`[IPv6]` 或域名。名称自动生成为 `host:port`。
+/// 空行和 `#` 注释行由调用方跳过。
+pub fn parse_proxy_line(line: &str, default_scheme: &str) -> Result<ProxyInput, ProxyPoolError> {
+    let line = line.trim();
+    let invalid = || {
+        ProxyPoolError::InvalidUrl(format!(
+            "无法识别的代理格式: {}",
+            truncate_chars(&redact_line(line), LINE_PREVIEW_CHARS)
+        ))
+    };
+    let default_scheme = default_scheme.trim().to_ascii_lowercase();
+    if !IMPORT_SCHEMES.contains(&default_scheme.as_str()) {
+        return Err(ProxyPoolError::Invalid(
+            "默认协议必须是 http、https、socks5 或 socks5h".into(),
+        ));
+    }
+    if line.is_empty() || line.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+
+    let (scheme, host, port, username, password) = if let Some(index) = line.find("://") {
+        let parsed = reqwest::Url::parse(line).map_err(|_| invalid())?;
+        if !IMPORT_SCHEMES.contains(&parsed.scheme()) {
+            return Err(invalid());
+        }
+        // 只接受 [userinfo@]host:port，不允许路径、查询等；必须显式写端口
+        let rest = &line[index + 3..];
+        let authority = rest
+            .rsplit_once('@')
+            .map_or(rest, |(_, host_port)| host_port)
+            .trim_end_matches('/');
+        let explicit_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && (!host.starts_with('[') || host.ends_with(']'))
+        });
+        if !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !explicit_port
+        {
+            return Err(invalid());
+        }
+        let host = parsed.host_str().filter(|h| !h.is_empty()).ok_or_else(invalid)?;
+        let port = parsed.port_or_known_default().ok_or_else(invalid)?;
+        let username = percent_decode(parsed.username()).ok_or_else(invalid)?;
+        let password = match parsed.password() {
+            Some(p) => percent_decode(p).ok_or_else(invalid)?,
+            None => String::new(),
+        };
+        (
+            parsed.scheme().to_string(),
+            host.to_string(),
+            port,
+            username,
+            password,
+        )
+    } else {
+        let (host, rest) = split_host(line).ok_or_else(invalid)?;
+        let mut parts = rest.splitn(3, ':');
+        let port = parts.next().ok_or_else(invalid)?;
+        let username = parts.next();
+        let password = parts.next();
+        let (username, password) = match (username, password) {
+            (None, None) => (String::new(), String::new()),
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => (u.to_string(), p.to_string()),
+            _ => return Err(invalid()),
+        };
+        let port: u16 = port.parse().map_err(|_| invalid())?;
+        (default_scheme, host.to_string(), port, username, password)
+    };
+    if port == 0 {
+        return Err(invalid());
+    }
+    let host_port = format!("{}:{}", host, port);
+    Ok(ProxyInput {
+        name: truncate_chars(&host_port, 64),
+        url: format!("{}://{}", scheme, host_port),
+        username: Some(username).filter(|v| !v.is_empty()),
+        password: Some(password).filter(|v| !v.is_empty()),
+        ..Default::default()
+    })
+}
+
+/// 拆出无协议行的 host 与剩余部分（`host:rest`），IPv6 需用方括号包裹
+fn split_host(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with('[') {
+        let end = line.find(']')?;
+        let host = &line[..=end];
+        host[1..end].parse::<std::net::Ipv6Addr>().ok()?;
+        let rest = line[end + 1..].strip_prefix(':')?;
+        Some((host, rest))
+    } else {
+        let (host, rest) = line.split_once(':')?;
+        if host.is_empty() || host.contains(['[', ']', '@', '/']) {
+            return None;
+        }
+        Some((host, rest))
+    }
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    urlencoding::decode(value).ok().map(|v| v.into_owned())
+}
+
+/// 错误信息里的原文去掉可能的密码：`user:pass@` → `user:***@`；`host:port:user:pass` → 末段打码
+fn redact_line(line: &str) -> String {
+    if let Some(index) = line.find("://") {
+        let rest = &line[index + 3..];
+        if let Some(at) = rest.rfind('@') {
+            let userinfo = &rest[..at];
+            let user = userinfo.split(':').next().unwrap_or("");
+            return format!("{}{}:***@{}", &line[..index + 3], user, &rest[at + 1..]);
+        }
+        return line.to_string();
+    }
+    // host:port:user:pass → 保留 host:port:user，其余打码
+    let host_end = if line.starts_with('[') {
+        line.find(']').map_or(0, |i| i + 1)
+    } else {
+        line.find(':').unwrap_or(line.len())
+    };
+    let (host, rest) = line.split_at(host_end);
+    let parts: Vec<&str> = rest.trim_start_matches(':').splitn(3, ':').collect();
+    if parts.len() == 3 {
+        return format!("{}:{}:{}:***", host, parts[0], parts[1]);
+    }
+    line.to_string()
 }
 
 fn validate_auth_pair(
@@ -1097,5 +1358,211 @@ mod tests {
             assert!(validate_proxy_url(bad).is_err(), "{bad}");
         }
         assert!(ProxyPool::in_memory(None).add(input("", "http://a:1")).is_err());
+    }
+
+    fn parsed(line: &str) -> (String, String, Option<String>, Option<String>) {
+        let input = parse_proxy_line(line, "socks5").unwrap();
+        (input.name, input.url, input.username, input.password)
+    }
+
+    #[test]
+    fn parse_line_url_with_auth() {
+        assert_eq!(
+            parsed("  http://alice:s3cret@10.0.0.1:3128  "),
+            (
+                "10.0.0.1:3128".into(),
+                "http://10.0.0.1:3128".into(),
+                Some("alice".into()),
+                Some("s3cret".into())
+            )
+        );
+        // 结果能通过 add 的校验（URL 不含认证信息）
+        let pool = ProxyPool::in_memory(None);
+        let entry = pool
+            .add(parse_proxy_line("socks5h://u:p@proxy.example.com:1080", "http").unwrap())
+            .unwrap();
+        assert_eq!(entry.url, "socks5h://proxy.example.com:1080");
+        assert_eq!(entry.name, "proxy.example.com:1080");
+    }
+
+    #[test]
+    fn parse_line_url_without_auth() {
+        assert_eq!(
+            parsed("https://proxy.example.com:8443"),
+            (
+                "proxy.example.com:8443".into(),
+                "https://proxy.example.com:8443".into(),
+                None,
+                None
+            )
+        );
+        // 端口等于协议默认端口时仍保留
+        assert_eq!(parsed("http://1.2.3.4:80").1, "http://1.2.3.4:80");
+    }
+
+    #[test]
+    fn parse_line_host_port_with_default_scheme() {
+        assert_eq!(
+            parsed("1.2.3.4:1080:bob:pw"),
+            (
+                "1.2.3.4:1080".into(),
+                "socks5://1.2.3.4:1080".into(),
+                Some("bob".into()),
+                Some("pw".into())
+            )
+        );
+        let input = parse_proxy_line("gw.example.com:8080", "http").unwrap();
+        assert_eq!(input.url, "http://gw.example.com:8080");
+        assert_eq!(input.username, None);
+        assert_eq!(input.password, None);
+        // 密码里可以带冒号
+        assert_eq!(parsed("1.2.3.4:1080:bob:a:b").3.as_deref(), Some("a:b"));
+        // 非法默认协议
+        assert!(parse_proxy_line("1.2.3.4:1080", "ftp").is_err());
+    }
+
+    #[test]
+    fn parse_line_ipv6() {
+        assert_eq!(
+            parsed("[2001:db8::1]:1080:u:p"),
+            (
+                "[2001:db8::1]:1080".into(),
+                "socks5://[2001:db8::1]:1080".into(),
+                Some("u".into()),
+                Some("p".into())
+            )
+        );
+        assert_eq!(parsed("[::1]:8080").1, "socks5://[::1]:8080");
+        assert_eq!(
+            parsed("http://u:p@[2001:db8::2]:3128").1,
+            "http://[2001:db8::2]:3128"
+        );
+        assert!(validate_proxy_url(&parsed("[::1]:8080").1).is_ok());
+    }
+
+    #[test]
+    fn parse_line_percent_encoded_credentials() {
+        let (_, url, username, password) = parsed("socks5://us%40er:p%40ss%3Aw%2Fd@1.2.3.4:1080");
+        assert_eq!(url, "socks5://1.2.3.4:1080");
+        assert_eq!(username.as_deref(), Some("us@er"));
+        assert_eq!(password.as_deref(), Some("p@ss:w/d"));
+    }
+
+    #[test]
+    fn parse_line_rejects_invalid() {
+        for bad in [
+            "not a proxy",
+            "1.2.3.4",
+            "1.2.3.4:",
+            "1.2.3.4:abc",
+            "1.2.3.4:70000",
+            "1.2.3.4:0",
+            "1.2.3.4:1080:onlyuser",
+            "1.2.3.4:1080::pw",
+            "2001:db8::1:1080",
+            "[2001:db8::1]1080",
+            "ftp://1.2.3.4:21",
+            "http://1.2.3.4",
+            "http://1.2.3.4:8080/path",
+            "http://1.2.3.4:8080?x=1",
+        ] {
+            let error = parse_proxy_line(bad, "socks5").unwrap_err();
+            assert!(matches!(error, ProxyPoolError::InvalidUrl(_)), "{bad}: {error:?}");
+        }
+        // 错误里带原文，截断到 80 字符，且不泄露密码
+        let long = format!("{}:1", "x".repeat(200));
+        let message = parse_proxy_line(&format!("{long}:u"), "socks5").unwrap_err().to_string();
+        assert!(message.contains(&"x".repeat(80)));
+        assert!(!message.contains(&"x".repeat(81)));
+        let message = parse_proxy_line("http://u:topsecret@1.2.3.4", "socks5")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("http://u:***@1.2.3.4"), "{message}");
+        assert!(!message.contains("topsecret"));
+    }
+
+    #[test]
+    fn add_batch_dedups_against_pool_and_within_batch() {
+        let pool = ProxyPool::in_memory(None);
+        let mut existing = input("old", "http://10.0.0.1:3128");
+        existing.username = Some("u".into());
+        existing.password = Some("p".into());
+        let existing = pool.add(existing).unwrap();
+
+        let lines = [
+            "HTTP://u:other@10.0.0.1:3128", // 与池中重复（scheme 大小写不同、密码不同）
+            "10.0.0.2:1080",
+            "socks5://10.0.0.2:1080", // 与第 2 行重复
+            "http://10.0.0.1:3128",   // 同地址无用户名 → 不算重复
+            "10.0.0.3:1080:u:p",
+        ];
+        let inputs = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| (i + 1, parse_proxy_line(line, "socks5").unwrap()))
+            .chain([(9, input("", "http://10.0.0.9:1"))]) // 校验失败
+            .collect();
+        let result = pool.add_batch(inputs);
+
+        assert_eq!(
+            result.added.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["10.0.0.2:1080", "10.0.0.1:3128", "10.0.0.3:1080"]
+        );
+        assert_eq!(
+            result.skipped,
+            vec![
+                BatchLineIssue {
+                    line: 1,
+                    reason: format!("已存在 #{}", existing.id)
+                },
+                BatchLineIssue {
+                    line: 3,
+                    reason: "与第 2 行重复".into()
+                },
+            ]
+        );
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].line, 9);
+        assert_eq!(pool.list().len(), 4);
+        // ID 连续分配
+        let ids: Vec<u64> = result.added.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![existing.id + 1, existing.id + 2, existing.id + 3]);
+
+        // 手填 URL 的 host 大小写不同、显式写默认端口也视为重复
+        let mixed = pool.add(input("mixed", "http://Proxy.Example.com")).unwrap();
+        let again = pool.add_batch(vec![(1, input("x", "http://proxy.example.COM:80"))]);
+        assert!(again.added.is_empty());
+        assert_eq!(again.skipped[0].reason, format!("已存在 #{}", mixed.id));
+    }
+
+    #[test]
+    fn add_batch_persists_once() {
+        let dir = temp_dir();
+        let config = Config::default();
+        let pool = ProxyPool::load(&dir, None, &config).unwrap();
+        let inputs = (1..=3)
+            .map(|i| (i, parse_proxy_line(&format!("10.0.1.{i}:1080:u:p{i}"), "socks5").unwrap()))
+            .collect();
+        let result = pool.add_batch(inputs);
+        assert_eq!(result.added.len(), 3);
+        assert_eq!(
+            pool.entries_persist_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let reloaded = ProxyPool::load(&dir, None, &config).unwrap();
+        assert_eq!(reloaded.list().len(), 3);
+        assert_eq!(reloaded.get(result.added[2].id).unwrap().password.as_deref(), Some("p3"));
+
+        // 全部跳过时不写文件
+        let before = std::fs::metadata(dir.join("proxies.json")).unwrap().modified().unwrap();
+        let again = pool.add_batch(vec![(1, parse_proxy_line("10.0.1.1:1080:u:x", "socks5").unwrap())]);
+        assert!(again.added.is_empty());
+        assert_eq!(again.skipped.len(), 1);
+        let after = std::fs::metadata(dir.join("proxies.json")).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

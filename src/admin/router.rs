@@ -10,7 +10,7 @@ use super::{
         add_credential, add_proxy, archive_credential, check_all_proxies,
         check_credential_egress, check_proxy, delete_proxy, force_refresh_token,
         get_all_credentials, get_core_config, get_credential_balance, get_load_balancing_mode,
-        list_proxies, purge_credential, reset_failure_count, set_credential_disabled, set_credential_priority,
+        import_proxies, list_proxies, purge_credential, reset_failure_count, set_credential_disabled, set_credential_priority,
         set_credential_proxy, set_load_balancing_mode, set_proxy_enabled, unarchive_credential,
         update_core_config, update_proxy,
     },
@@ -37,6 +37,7 @@ use super::{
 /// - `POST /proxies/:id/enabled` - 启用或停用出口代理
 /// - `POST /proxies/:id/check` - 检测单个出口代理
 /// - `POST /proxies/check-all` - 检测全部启用的出口代理
+/// - `POST /proxies/import` - 批量导入出口代理（每行一个）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
@@ -70,6 +71,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/check-egress", post(check_credential_egress))
         .route("/proxies", get(list_proxies).post(add_proxy))
         .route("/proxies/check-all", post(check_all_proxies))
+        .route("/proxies/import", post(import_proxies))
         .route("/proxies/{id}", put(update_proxy).delete(delete_proxy))
         .route("/proxies/{id}/enabled", post(set_proxy_enabled))
         .route("/proxies/{id}/check", post(check_proxy))
@@ -911,6 +913,76 @@ mod tests {
         let (status, _) =
             request(&fixture.app, "DELETE", &format!("/proxies/{id}"), &admin_key, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_proxies_reports_added_skipped_failed() {
+        let fixture = fixture();
+        let (admin, admin_key) = create_admin(&fixture.store, &fixture.super_admin, "import-admin");
+        let (_, user_key) = fixture
+            .store
+            .create_user(&admin, "import-member", "password-123", Role::User, 0.0)
+            .unwrap();
+        // 检测目标不出网；127.0.0.1:1 拒绝连接，检测很快失败
+        fixture
+            .proxy_pool
+            .set_egress_check_url_for_test("http://egress.invalid/");
+        let existing = add_proxy(&fixture.app, &admin_key, "old", "socks5://10.0.0.1:1080").await;
+
+        let text = "# 注释行\n\nhttp://import-user:import-secret-pass@127.0.0.1:1\nnot-a-proxy\n10.0.0.1:1080\n";
+        let payload = json!({"text": text, "defaultScheme": "socks5"});
+
+        let (status, _) =
+            request(&fixture.app, "POST", "/proxies/import", &user_key, Some(payload.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) =
+            request(&fixture.app, "POST", "/proxies/import", &admin_key, Some(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["totalLines"], 5);
+        let added = body["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1, "{body}");
+        assert_eq!(added[0]["name"], "127.0.0.1:1");
+        assert_eq!(added[0]["url"], "http://127.0.0.1:1");
+        assert_eq!(added[0]["username"], "import-user");
+        assert_eq!(added[0]["passwordSet"], true);
+        // 默认导入后检测：连接被拒绝 → 异常，并附在响应里
+        assert_eq!(added[0]["health"]["status"], "unhealthy", "{body}");
+        assert!(added[0]["health"]["checkedAt"].is_string());
+        assert_eq!(
+            body["skipped"],
+            json!([{"line": 5, "reason": format!("已存在 #{existing}")}])
+        );
+        let failed = body["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["line"], 4);
+        assert!(failed[0]["reason"].as_str().unwrap().contains("not-a-proxy"));
+        assert!(!body.to_string().contains("import-secret-pass"));
+
+        // 不检测时健康状态保持未知；非法默认协议 400
+        let (status, body) = request(
+            &fixture.app,
+            "POST",
+            "/proxies/import",
+            &admin_key,
+            Some(json!({"text": "10.0.0.5:3128", "defaultScheme": "http", "checkAfterImport": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["added"][0]["url"], "http://10.0.0.5:3128");
+        assert_eq!(body["added"][0]["health"]["status"], "unknown");
+        let (status, _) = request(
+            &fixture.app,
+            "POST",
+            "/proxies/import",
+            &admin_key,
+            Some(json!({"text": "10.0.0.6:3128", "defaultScheme": "ftp"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, list) = request(&fixture.app, "GET", "/proxies", &admin_key, None).await;
+        assert_eq!(list["proxies"].as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]

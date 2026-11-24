@@ -143,6 +143,27 @@ export interface ProxyInput {
   note?: string
 }
 
+export type ProxyImportScheme = 'socks5' | 'socks5h' | 'http' | 'https'
+
+// 批量导入代理：每行一个，空行和 # 注释忽略
+export interface ImportProxiesRequest {
+  text: string
+  defaultScheme?: ProxyImportScheme
+  checkAfterImport?: boolean
+}
+
+export interface ProxyImportLineIssue {
+  line: number
+  reason: string
+}
+
+export interface ImportProxiesResponse {
+  added: ProxyItem[]
+  skipped: ProxyImportLineIssue[]
+  failed: ProxyImportLineIssue[]
+  totalLines: number
+}
+
 // 添加凭据响应
 export interface AddCredentialResponse {
   success: boolean

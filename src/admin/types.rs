@@ -244,6 +244,32 @@ pub struct ProxyListResponse {
     pub proxies: Vec<ProxyItem>,
 }
 
+/// 批量导入代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProxiesRequest {
+    /// 每行一个代理，空行和 `#` 注释行忽略
+    pub text: String,
+    /// 行中没有协议前缀时使用，默认 socks5
+    #[serde(default)]
+    pub default_scheme: Option<String>,
+    /// 导入后立即检测新增代理，默认 true
+    #[serde(default)]
+    pub check_after_import: Option<bool>,
+}
+
+/// 批量导入代理响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProxiesResponse {
+    /// 新增的代理（不含密码，health 为导入后检测结果或未知）
+    pub added: Vec<ProxyItem>,
+    pub skipped: Vec<crate::proxy_pool::BatchLineIssue>,
+    pub failed: Vec<crate::proxy_pool::BatchLineIssue>,
+    /// 原文总行数（含空行和注释）
+    pub total_lines: usize,
+}
+
 /// 设置代理启用状态请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

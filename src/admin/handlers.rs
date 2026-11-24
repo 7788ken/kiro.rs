@@ -13,7 +13,8 @@ use crate::accounts::AuthUser;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, ArchiveCredentialRequest, SetCredentialProxyRequest, SetDisabledRequest,
+        AddCredentialRequest, ArchiveCredentialRequest, ImportProxiesRequest,
+        SetCredentialProxyRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetProxyEnabledRequest, SuccessResponse,
     },
 };
@@ -326,6 +327,18 @@ pub async fn check_proxy(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.check_proxy(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/import
+/// 批量导入代理（每行一个，空行和 `#` 注释忽略）
+pub async fn import_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportProxiesRequest>,
+) -> impl IntoResponse {
+    match state.service.import_proxies(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
