@@ -9,7 +9,7 @@
   │ HTTPS :6091
   ▼
 Caddy（TLS 终止、反向代理、蓝绿切流）
-  │ HTTP 容器 IP:6091（本机 16091 / 16092 仅用于检查）
+  │ HTTP 127.0.0.1:16091（蓝）/ 127.0.0.1:16092（绿）
   ▼
 kiro-rs 蓝 / 绿容器（共享配置和 MySQL）
   ├── config.json          服务与上游配置
@@ -268,16 +268,63 @@ journalctl -u caddy --since '15 minutes ago' --no-pager
 
 1. 保留旧实例与流量，构建并启动另一颜色的候选实例。
 2. 检查 `/health/live`、`/health/ready`、管理页、MySQL 预授权状态，并用专用测试 Key 执行最小真实流式请求。
-3. 通过 Caddy 管理 API 的 `ETag` / `If-Match` 原子替换 `@id kiro_rs_active` 的 upstream，避免并发覆盖。
+3. 原子改写 upstream 片段文件 `/etc/caddy/kiro-rs-upstream.caddy`，先 `caddy validate` 再 reload Caddyfile；随后经公网 `/health/ready` 确认 `instance` 已变为目标颜色。
 4. 切流后再次验收。失败时立即恢复旧 upstream，旧实例未通过验收前不会停止。
 5. 旧实例收到 `SIGTERM` 后停止接收新连接，等待在途响应体（包括 SSE）完成，再退出并清理。
 
-### 8.1 Caddy 配置与持久化
+### 8.1 Caddy 配置
 
+活跃 upstream 只记录在一个片段文件里，Caddyfile 是唯一的配置来源，Caddy 重启后按文件恢复，不依赖管理 API 的运行时状态。kiro 站点块写法：
+
+```caddy
+https://服务器IP:6091 {
+    tls {
+        issuer acme {
+            profile shortlived
+        }
+    }
+    encode zstd gzip
+    reverse_proxy {
+        import /etc/caddy/kiro-rs-upstream.caddy
+        flush_interval -1
+        transport http {
+            read_timeout 600s
+            write_timeout 600s
+            dial_timeout 10s
+            keepalive 120s
+        }
+    }
+}
+```
+
+`/etc/caddy/kiro-rs-upstream.caddy` 只含一行 reverse_proxy 子指令，例如：
+
+```caddy
+to 127.0.0.1:16091
+```
+
+初始化（只做一次，在第一次蓝绿部署前）：
+
+```bash
+# 1. 确认当前活跃端口（首次迁移时为 compose 启动的 kiro-rs，即 16091）
+curl -fsS http://127.0.0.1:16091/health/ready
+# 2. 创建片段文件，写入当前活跃端口
+printf 'to 127.0.0.1:16091\n' | sudo tee /etc/caddy/kiro-rs-upstream.caddy
+# 3. 备份 Caddyfile，把 kiro 站点块的 reverse_proxy 改为上面的 import 写法
+sudo cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%Y%m%d%H%M%S)
+# 4. 校验，再 reload
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force
+```
+
+说明：
+
+- 片段路径、Caddyfile 路径和 reload 命令分别由 `KIRO_CADDY_UPSTREAM_FILE`、`CADDYFILE`、`KIRO_CADDY_RELOAD_CMD` 配置，默认 reload 命令与 `caddy-api.service` 的 `ExecReload` 一致。
+- 实例身份以本机端口 `127.0.0.1:<local_port>` 为准；状态文件中的 `address`（容器 IP）仅供展示。每次部署开始时，脚本要求片段中的地址等于活跃实例的本机端口，否则拒绝继续。
+- 脚本每次切流都会 reload **整份共用 Caddyfile**，同机其他站点的未生效改动也会一并加载，因此 reload 前必定先 `caddy validate`；校验失败时回写旧片段且不 reload。reload 失败时回写旧片段并再 reload 一次，然后报错。
+- 部署前检查：Caddyfile 包含 `import <片段路径>`、片段存在且只有一行 `to`、`caddy validate` 通过。
 - Caddy 管理 API 只监听 `127.0.0.1:2019`，不能暴露公网。
-- 使用系统 `caddy-api.service`，以 `caddy run --resume` 恢复管理 API 的最新配置。普通 `caddy.service` 从 Caddyfile 启动，会丢失 API 切流状态，不能混用。
-- 目标代理 handler 必须带 `@id kiro_rs_active`，脚本只修改这个 handler 的 upstream，不操作其他站点。
-- 当前 Caddyfile 仍是人工审计和紧急恢复参考；管理 API 配置保存在 Caddy 的 autosave 文件中。修改 Caddyfile 后通过 API `/load` 加载，不要在生产直接重启代理。
+- `unhealthy_status`、主动或被动健康检查不在本方案内，Caddyfile 保持单 upstream。
 
 ### 8.2 服务器本地配置
 
@@ -320,10 +367,11 @@ python3 deploy/blue_green.py rollback --env deployment.env
 python3 deploy/blue_green.py cleanup --env deployment.env
 ```
 
-手动恢复时，先检查状态文件、容器和 Caddy upstream 是否一致，不要盲目重建或删除实例。Caddy 管理 API 支持：
+手动恢复时，先检查状态文件、容器和 Caddy upstream 是否一致，不要盲目重建或删除实例：
 
 ```bash
-curl http://127.0.0.1:2019/id/kiro_rs_active/upstreams
+cat /etc/caddy/kiro-rs-upstream.caddy
+curl -k https://服务器IP:6091/health/ready   # instance 字段为当前接流颜色
 curl http://127.0.0.1:16091/health/ready
 curl http://127.0.0.1:16092/health/ready
 ```

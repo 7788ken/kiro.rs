@@ -5,6 +5,8 @@ import argparse
 import fcntl
 import json
 import os
+import shlex
+import ssl
 import subprocess
 import sys
 import time
@@ -37,7 +39,7 @@ def run(args, *, capture=True, check=True, env=None):
     )
 
 
-def request(url, *, method="GET", body=None, headers=None, timeout=10):
+def request(url, *, method="GET", body=None, headers=None, timeout=10, context=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         url,
@@ -46,7 +48,7 @@ def request(url, *, method="GET", body=None, headers=None, timeout=10):
         headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as response:
             return response.status, dict(response.headers), response.read().decode()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read().decode()
@@ -64,7 +66,11 @@ class Deploy:
             "blue": int(self.env.get("KIRO_BLUE_PORT", "16091")),
             "green": int(self.env.get("KIRO_GREEN_PORT", "16092")),
         }
-        self.caddy = self.env.get("CADDY_ADMIN", "http://127.0.0.1:2019")
+        self.caddyfile = self.env.get("CADDYFILE", "/etc/caddy/Caddyfile")
+        self.upstream_file = Path(self.env.get("KIRO_CADDY_UPSTREAM_FILE", "/etc/caddy/kiro-rs-upstream.caddy"))
+        self.reload_command = self.env.get(
+            "KIRO_CADDY_RELOAD_CMD", "caddy reload --config {caddyfile} --adapter caddyfile --force"
+        )
         self.site_port = self.env.get("KIRO_SITE_PORT", "6091")
         self.public_url = self.env.get("KIRO_PUBLIC_URL", "")
         self.readiness_seconds = int(self.env.get("KIRO_READINESS_SECONDS", "90"))
@@ -110,14 +116,16 @@ class Deploy:
             path.chmod(0o600)
         self.info(f"升级前备份完成: {directory}")
 
-    def check_caddy_persistence(self):
-        service = run(["systemctl", "is-active", "caddy-api"], check=False)
-        if service.returncode or service.stdout.strip() != "active":
-            raise RuntimeError("必须启用 caddy-api.service，确保重启后恢复最新 upstream")
-        command = run(["systemctl", "show", "caddy-api", "--property=ExecStart", "--value"])
-        if "--resume" not in command.stdout:
-            raise RuntimeError("caddy-api 未使用 --resume，管理 API 切流状态不能持久化")
-        self.info("Caddy 管理 API 持久化检查通过")
+    def check_caddy_config(self):
+        try:
+            lines = [line.strip() for line in Path(self.caddyfile).read_text().splitlines()]
+        except OSError as error:
+            raise RuntimeError(f"读取 Caddyfile 失败: {self.caddyfile}: {error}") from error
+        if f"import {self.upstream_file}" not in lines:
+            raise RuntimeError(f"Caddyfile 缺少 import {self.upstream_file}，请先按部署手册 8.1 初始化")
+        self.upstream()
+        self.validate_caddy()
+        self.info("Caddy 配置检查通过")
 
     def check_https(self, url):
         command = ["curl", "-fsS", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code}"]
@@ -197,37 +205,111 @@ class Deploy:
         self.save_state(state)
         return state
 
-    def proxy_path(self):
-        return "/id/kiro_rs_active"
+    def local_address(self, instance):
+        if not instance.get("local_port"):
+            raise RuntimeError(f"实例 {instance.get('name')} 没有本机端口")
+        return f"127.0.0.1:{instance['local_port']}"
+
+    def color_for(self, address):
+        host, _, port = address.rpartition(":")
+        color = next(
+            (color for color, local in self.local_ports.items() if host == "127.0.0.1" and str(local) == port),
+            None,
+        )
+        if color is None:
+            raise RuntimeError(f"upstream {address} 不是蓝绿本机端口")
+        return color
+
+    def read_upstream_file(self):
+        try:
+            return self.upstream_file.read_text()
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"upstream 片段 {self.upstream_file} 不存在，请先按部署手册 8.1 初始化"
+            ) from error
 
     def upstream(self):
-        path = self.proxy_path()
-        status, _, body = request(f"{self.caddy}{path}/upstreams")
-        if status != 200:
-            raise RuntimeError("读取 Caddy upstream 失败")
-        upstreams = json.loads(body)
-        if len(upstreams) != 1:
-            raise RuntimeError("kiro-rs 必须只有一个活跃 upstream")
-        return upstreams[0]["dial"]
+        lines = [
+            line.strip() for line in self.read_upstream_file().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        tokens = lines[0].split() if len(lines) == 1 else []
+        if len(tokens) != 2 or tokens[0] != "to":
+            raise RuntimeError(f"upstream 片段 {self.upstream_file} 必须只有一行 `to 127.0.0.1:<port>`")
+        return tokens[1]
+
+    def write_upstream_file(self, content):
+        temporary = self.upstream_file.with_name(f".{self.upstream_file.name}.tmp")
+        temporary.write_text(content)
+        if self.upstream_file.exists():
+            current = self.upstream_file.stat()
+            os.chmod(temporary, current.st_mode & 0o777)
+            if os.geteuid() == 0:
+                os.chown(temporary, current.st_uid, current.st_gid)
+        os.replace(temporary, self.upstream_file)
+
+    def validate_caddy(self):
+        result = run(["caddy", "validate", "--config", self.caddyfile, "--adapter", "caddyfile"], check=False)
+        if result.returncode:
+            raise RuntimeError(f"caddy validate 失败: {(result.stderr or result.stdout)[-500:]}")
+
+    def reload_caddy(self):
+        command = shlex.split(self.reload_command.format(caddyfile=shlex.quote(self.caddyfile)))
+        result = run(command, check=False)
+        if result.returncode:
+            raise RuntimeError(f"Caddy reload 失败: {(result.stderr or result.stdout)[-500:]}")
+
+    def expected_instance(self, address):
+        color = self.color_for(address)
+        try:
+            status, _, body = request(f"http://{address}/health/ready", timeout=5)
+            reported = json.loads(body).get("instance") if status == 200 else None
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"读取本机 {address}/health/ready 失败: {error}") from error
+        # 首次蓝绿前由 compose 启动的 kiro-rs 没有 KIRO_INSTANCE，自报 standalone。
+        if reported not in {color, "standalone"}:
+            raise RuntimeError(f"本机端口 {address} 上的实例自报 {reported}，与颜色 {color} 不符")
+        return reported
+
+    def wait_public_instance(self, expected):
+        if not self.public_url:
+            self.info("未配置 KIRO_PUBLIC_URL，跳过公网实例确认")
+            return
+        context = None if self.tls_verify else ssl._create_unverified_context()
+        deadline = time.monotonic() + 15
+        reported = None
+        while time.monotonic() < deadline:
+            try:
+                status, _, body = request(f"{self.public_url}/health/ready", timeout=3, context=context)
+                reported = json.loads(body).get("instance") if status == 200 else None
+                if reported == expected:
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(1)
+        raise RuntimeError(f"切流后 15 秒内公网 /health/ready 的 instance 仍为 {reported}，预期 {expected}")
 
     def set_upstream(self, address):
-        path = self.proxy_path()
-        url = f"{self.caddy}{path}/upstreams"
-        status, headers, body = request(url)
-        etag = headers.get("Etag") or headers.get("ETag")
-        if status != 200 or not etag:
-            raise RuntimeError("读取 upstream ETag 失败，拒绝切流")
-        status, _, body = request(
-            url,
-            method="PATCH",
-            body=[{"dial": address}],
-            headers={"If-Match": etag},
-        )
-        if status != 200:
-            raise RuntimeError(f"Caddy 条件切流失败 HTTP {status}: {body[:300]}")
-        if self.upstream() != address:
-            raise RuntimeError("Caddy 切流后 upstream 与预期不符")
-        self.info(f"Caddy 活跃 upstream: {address}")
+        self.color_for(address)
+        previous = self.read_upstream_file()
+        self.write_upstream_file(f"to {address}\n")
+        try:
+            self.validate_caddy()
+        except RuntimeError:
+            self.write_upstream_file(previous)
+            raise
+        try:
+            self.reload_caddy()
+        except RuntimeError as error:
+            self.write_upstream_file(previous)
+            try:
+                self.reload_caddy()
+            except RuntimeError as retry:
+                raise RuntimeError(f"{error}；回写旧 upstream 后再次 reload 也失败: {retry}") from error
+            raise RuntimeError(f"{error}；已回写旧 upstream 并重新 reload") from error
+        expected = self.expected_instance(address)
+        self.wait_public_instance(expected)
+        self.info(f"Caddy 活跃 upstream: {address}（{expected}）")
 
     def check_ready(self, instance):
         if not instance.get("local_port"):
@@ -365,15 +447,11 @@ class Deploy:
         state = self.active_state()
         active = state["active"]
         current_upstream = self.upstream()
-        expected = active.get("address")
+        expected = self.local_address(active)
         if current_upstream != expected:
-            if active["name"] == "kiro-rs" and current_upstream == f"127.0.0.1:{active['local_port']}":
-                self.info("首次迁移：将 Caddy 从本机端口切到旧容器 IP，旧进程不重启")
-                self.set_upstream(expected)
-            else:
-                raise RuntimeError(f"Caddy upstream {current_upstream} 与活跃实例 {expected} 不一致")
+            raise RuntimeError(f"Caddy upstream {current_upstream} 与活跃实例 {expected} 不一致")
         candidate = state.get("candidate", self.candidate(state))
-        self.check_caddy_persistence()
+        self.check_caddy_config()
         self.backup()
         expected_name = self.candidate(state)["name"]
         if candidate.get("name") != expected_name:
@@ -402,7 +480,7 @@ class Deploy:
                 self.start_candidate(candidate)
             self.info(f"候选就绪: {json.dumps(self.check_ready(candidate), ensure_ascii=False)}")
             self.verify(candidate)
-            self.set_upstream(candidate["address"])
+            self.set_upstream(self.local_address(candidate))
             switched = True
             state["phase"] = "verifying_active"
             self.save_state(state)
@@ -428,8 +506,10 @@ class Deploy:
                 self.save_state(state)
                 self.info("新版本已接管流量；旧版本继续排空，状态为 awaiting_drain")
         except Exception as error:
+            # 片段已写入候选（例如 reload 成功但公网确认超时）时同样视为已切流，需要恢复。
+            switched = switched or self.upstream() != self.local_address(active)
             if switched:
-                self.set_upstream(active["address"])
+                self.set_upstream(self.local_address(active))
                 self.verify(active)
                 self.info("切流后验收失败，已恢复旧实例流量")
             state["phase"] = "failed" if switched else "candidate_failed"
@@ -447,7 +527,7 @@ class Deploy:
         current = state["active"]
         self.check_ready(previous)
         self.verify(previous)
-        self.set_upstream(previous["address"])
+        self.set_upstream(self.local_address(previous))
         state["active"] = previous
         state["previous"] = current
         state["phase"] = "draining_rollback"
