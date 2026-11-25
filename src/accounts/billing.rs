@@ -167,6 +167,7 @@ pub async fn billing_middleware(
     );
     let response = next.run(request).await;
     guard.http_status = response.status().as_u16();
+    guard.response_started = true;
     let (response_parts, body) = response.into_parts();
     let is_sse = response_parts
         .headers
@@ -220,6 +221,8 @@ struct BillingGuard {
     stream: bool,
     started_at: Instant,
     http_status: u16,
+    /// 下游 handler 已返回响应头。为 false 时 drop 说明客户端在响应开始前取消了请求
+    response_started: bool,
     first_token_ms: Option<i64>,
     input_tokens: i64,
     output_tokens: i64,
@@ -254,6 +257,7 @@ impl BillingGuard {
             stream,
             started_at,
             http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            response_started: false,
             first_token_ms: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -388,7 +392,15 @@ impl BillingGuard {
                 .get()
                 .or(self.reported_credits)
                 .is_some_and(|credits| credits > 0.0);
-            let message = if has_credential_usage {
+            let message = if !self.response_started {
+                // 499：客户端在响应头产生前断开，handler 被取消，不是上游失败
+                self.http_status = 499;
+                if has_credential_usage {
+                    "客户端在响应开始前取消请求，已按收到的凭证消耗结算".to_string()
+                } else {
+                    "客户端在响应开始前取消请求，预扣积分已全额返还".to_string()
+                }
+            } else if has_credential_usage {
                 "连接已中断，已按收到的凭证消耗结算".to_string()
             } else if self.stream && self.http_status().is_success() {
                 "客户端中断连接，上游未返回凭证消耗，预扣积分已全额返还".to_string()

@@ -328,6 +328,7 @@ async fn interrupted_stream_is_an_error_and_refunds_reservation() {
     let logs = transactions(&state, &key);
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].amount_micro, 0);
+    assert_eq!(logs[0].kind, "charge");
     assert_eq!(logs[0].http_status, Some(200));
     assert!(
         logs[0]
@@ -336,6 +337,47 @@ async fn interrupted_stream_is_an_error_and_refunds_reservation() {
             .unwrap()
             .contains("客户端中断连接")
     );
+    assert_eq!(logs[0].balance_after_micro, 1_000_000);
+}
+
+#[tokio::test]
+async fn cancel_before_response_is_499_and_refunds_reservation() {
+    let (state, key, id) = user_fixture();
+    // 上游一直不返回响应头，模拟流式请求等首字时客户端断开
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post(|| std::future::pending::<Response>()),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::billing::billing_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .with_state(state.clone());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        app.oneshot(request(
+            &key,
+            json!({"model":"claude-sonnet-4-6","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hello"}]}),
+        )),
+    )
+    .await;
+    assert!(result.is_err(), "handler must still be pending when cancelled");
+    assert_eq!(
+        state.store.get_user_view(id).unwrap().balance_micro,
+        1_000_000
+    );
+    let logs = transactions(&state, &key);
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].kind, "charge");
+    assert_eq!(logs[0].amount_micro, 0);
+    assert_eq!(logs[0].http_status, Some(499));
+    assert_eq!(
+        logs[0].error_message.as_deref(),
+        Some("客户端在响应开始前取消请求，预扣积分已全额返还")
+    );
+    assert_eq!(logs[0].refund_micro, logs[0].reserved_micro);
     assert_eq!(logs[0].balance_after_micro, 1_000_000);
 }
 
