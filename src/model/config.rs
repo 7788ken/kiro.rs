@@ -113,6 +113,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_check_url: Option<String>,
 
+    /// 站点名称（后台页头、登录页和浏览器标题），未配置时前端显示默认名称
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+
+    /// 站点 Logo（data URL，如 data:image/png;base64,...）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_data_url: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -189,6 +197,8 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             egress_check_url: None,
+            site_name: None,
+            logo_data_url: None,
             config_path: None,
         }
     }

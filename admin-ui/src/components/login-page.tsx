@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import { KeyRound, Loader2, LogIn, ShieldCheck } from 'lucide-react'
 import { getAccount, loginWithPassword } from '@/api/accounts'
 import { storage } from '@/lib/storage'
+import { useBranding } from '@/hooks/use-branding'
 import { extractErrorMessage } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -15,6 +16,7 @@ export function LoginPage({ onLogin }: { onLogin: (account: AccountOverview) => 
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [pending, setPending] = useState(false)
+  const { siteName, logoDataUrl } = useBranding()
 
   const submitKey = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -42,7 +44,7 @@ export function LoginPage({ onLogin }: { onLogin: (account: AccountOverview) => 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10 antialiased">
       <div className="w-full max-w-[400px]">
-        <div className="mb-8 text-center"><div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-[0_8px_24px_-8px_hsl(var(--primary)/0.5)]"><KeyRound className="h-[22px] w-[22px]" /></div><h1 className="mt-5 text-balance text-[26px] font-semibold tracking-[-0.03em]">Kiro Console</h1><p className="mt-2 text-sm text-muted-foreground">统一管理服务、用户与用量</p></div>
+        <div className="mb-8 text-center">{logoDataUrl ? <img src={logoDataUrl} alt="" className="mx-auto h-12 w-12 rounded-2xl object-contain" /> : <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-[0_8px_24px_-8px_hsl(var(--primary)/0.5)]"><KeyRound className="h-[22px] w-[22px]" /></div>}<h1 className="mt-5 text-balance break-words text-[26px] font-semibold tracking-[-0.03em]">{siteName}</h1><p className="mt-2 text-sm text-muted-foreground">统一管理服务、用户与用量</p></div>
         <Card className="shadow-[0_12px_40px_-18px_rgba(15,23,42,0.16)]">
           <CardHeader className="p-6 pb-4"><CardTitle className="text-xl">欢迎回来</CardTitle><CardDescription>登录以进入你的管理工作台</CardDescription></CardHeader>
           <CardContent className="p-6 pt-2">

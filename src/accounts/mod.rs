@@ -18,4 +18,4 @@ pub use store::AccountStore;
 
 pub use middleware::AccountState;
 pub use models::{AuthUser, Role};
-pub use router::{account_router, admin_account_router, login_router};
+pub use router::{account_router, admin_account_router, branding_router, login_router};

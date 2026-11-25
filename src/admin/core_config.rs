@@ -31,6 +31,8 @@ pub struct CoreConfigResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_username: Option<String>,
     pub proxy_password_set: bool,
+    pub site_name: Option<String>,
+    pub logo_data_url: Option<String>,
     pub revision: u64,
 }
 
@@ -53,7 +55,25 @@ pub struct UpdateCoreConfigRequest {
     pub clear_proxy_username: Option<bool>,
     pub proxy_password: Option<String>,
     pub clear_proxy_password: Option<bool>,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(default)]
+    pub logo_data_url: Option<String>,
+    #[serde(default)]
+    pub clear_logo: Option<bool>,
 }
+
+/// 站点名称最大字符数
+pub const MAX_SITE_NAME_CHARS: usize = 60;
+/// Logo data URL 整串最大字节数（200 KB）
+pub const MAX_LOGO_DATA_URL_BYTES: usize = 200 * 1024;
+const LOGO_MIME_TYPES: &[&str] = &[
+    "image/svg+xml",
+    "image/png",
+    "image/jpeg",
+    "image/x-icon",
+    "image/webp",
+];
 
 pub struct CoreConfigService {
     runtime: Arc<RuntimeConfig>,
@@ -108,6 +128,8 @@ impl CoreConfigService {
             }),
             proxy_username: None,
             proxy_password_set: config.proxy_password.is_some(),
+            site_name: config.site_name.clone(),
+            logo_data_url: config.logo_data_url.clone(),
             revision: self.runtime.revision(),
         }
     }
@@ -199,6 +221,24 @@ impl CoreConfigService {
                 "不能同时设置新代理密码和清除认证".into(),
             ));
         }
+        // 未传 siteName 保留原值；传空串（trim 后）表示清除
+        let site_name = request
+            .site_name
+            .as_deref()
+            .map(|name| Some(name.trim().to_string()).filter(|name| !name.is_empty()));
+        if site_name
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|name| name.chars().count() > MAX_SITE_NAME_CHARS)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "站点名称不能超过 {MAX_SITE_NAME_CHARS} 个字符"
+            )));
+        }
+        let clear_logo = request.clear_logo == Some(true);
+        if !clear_logo && let Some(logo) = &request.logo_data_url {
+            validate_logo_data_url(logo)?;
+        }
         let path = self.runtime.path().to_path_buf();
         let _file_lock =
             crate::shared_files::acquire(&path.with_extension("lock")).map_err(internal)?;
@@ -224,6 +264,14 @@ impl CoreConfigService {
             next.proxy_password = None;
         } else if let Some(password) = request.proxy_password.filter(|value| !value.is_empty()) {
             next.proxy_password = Some(password);
+        }
+        if let Some(site_name) = site_name {
+            next.site_name = site_name;
+        }
+        if clear_logo {
+            next.logo_data_url = None;
+        } else if let Some(logo) = request.logo_data_url {
+            next.logo_data_url = Some(logo);
         }
         if next.proxy_url.is_none() {
             next.proxy_username = None;
@@ -251,13 +299,17 @@ impl CoreConfigService {
         }
         self.token_manager.replace(next.clone());
         if let Some(provider_lock) = self.anthropic.read().kiro_provider.as_ref() {
-            let endpoints = provider_lock.read().endpoints().clone();
+            let (endpoints, version_check) = {
+                let current = provider_lock.read();
+                (current.endpoints().clone(), current.version_check())
+            };
             let new_provider = KiroProvider::with_proxy(
                 self.token_manager.clone(),
                 crate::runtime_config::proxy_from_config(&next),
                 endpoints,
                 next.default_endpoint.clone(),
-            );
+            )
+            .with_version_check(version_check);
             *provider_lock.write() = Arc::new(new_provider);
         }
         self.anthropic
@@ -268,6 +320,44 @@ impl CoreConfigService {
         tracing::info!(actor = %actor.username, revision = self.runtime.revision(), "核心配置已保存并热重载");
         Ok(self.get())
     }
+}
+
+/// 校验 Logo data URL：限定图片 MIME、整串长度和 base64 合法性
+fn validate_logo_data_url(logo: &str) -> Result<(), AdminServiceError> {
+    if logo.len() > MAX_LOGO_DATA_URL_BYTES {
+        return Err(AdminServiceError::InvalidCredential(
+            "Logo 不能超过 200 KB".into(),
+        ));
+    }
+    let payload = LOGO_MIME_TYPES.iter().find_map(|mime| {
+        logo.strip_prefix("data:")
+            .and_then(|rest| rest.strip_prefix(mime))
+            .and_then(|rest| rest.strip_prefix(";base64,"))
+    });
+    match payload {
+        Some(payload) if is_valid_base64(payload) => Ok(()),
+        Some(_) => Err(AdminServiceError::InvalidCredential(
+            "Logo 的 base64 数据无效".into(),
+        )),
+        None => Err(AdminServiceError::InvalidCredential(
+            "Logo 仅支持 SVG、PNG、JPEG、ICO、WebP 格式的 base64 data URL".into(),
+        )),
+    }
+}
+
+/// 标准 base64（带填充）可解码性校验：长度为 4 的倍数、字符集合法、`=` 仅出现在末尾且最多两个
+fn is_valid_base64(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let padding = bytes.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 {
+        return false;
+    }
+    bytes[..bytes.len() - padding]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 fn internal(error: impl std::fmt::Display) -> AdminServiceError {
@@ -329,6 +419,9 @@ mod tests {
             clear_proxy_username: None,
             proxy_password: None,
             clear_proxy_password: None,
+            site_name: current.site_name,
+            logo_data_url: None,
+            clear_logo: None,
         }
     }
 
@@ -389,5 +482,93 @@ mod tests {
         let mut request = request(&service);
         request.proxy_url = Some("http://user:password@localhost:7890".into());
         assert!(service.update(&admin(), request).is_err());
+    }
+
+    const PNG_LOGO: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    fn assert_bad_request(result: Result<CoreConfigResponse, AdminServiceError>) {
+        match result {
+            Err(error) => assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("应返回 400"),
+        }
+    }
+
+    #[test]
+    fn saves_and_round_trips_site_name_and_logo() {
+        let (service, runtime, _manager, _state, _dir) = service();
+        let mut request = request(&service);
+        request.site_name = Some("  我的站点  ".into());
+        request.logo_data_url = Some(PNG_LOGO.into());
+        let result = service.update(&admin(), request).unwrap();
+        assert_eq!(result.site_name.as_deref(), Some("我的站点"));
+        assert_eq!(result.logo_data_url.as_deref(), Some(PNG_LOGO));
+        assert_eq!(runtime.get().site_name.as_deref(), Some("我的站点"));
+        let persisted = Config::load(runtime.path()).unwrap();
+        assert_eq!(persisted.site_name.as_deref(), Some("我的站点"));
+        assert_eq!(persisted.logo_data_url.as_deref(), Some(PNG_LOGO));
+
+        // 未传 logo 时保留原值；site_name 传空串清除
+        let mut request = super::tests::request(&service);
+        request.site_name = Some("   ".into());
+        let result = service.update(&admin(), request).unwrap();
+        assert_eq!(result.site_name, None);
+        assert_eq!(result.logo_data_url.as_deref(), Some(PNG_LOGO));
+    }
+
+    #[test]
+    fn clear_logo_removes_saved_logo() {
+        let (service, runtime, _manager, _state, _dir) = service();
+        let mut request = request(&service);
+        request.logo_data_url = Some(PNG_LOGO.into());
+        service.update(&admin(), request).unwrap();
+        let mut request = super::tests::request(&service);
+        request.clear_logo = Some(true);
+        let result = service.update(&admin(), request).unwrap();
+        assert_eq!(result.logo_data_url, None);
+        assert_eq!(Config::load(runtime.path()).unwrap().logo_data_url, None);
+    }
+
+    #[test]
+    fn rejects_invalid_logo_data_url() {
+        let (service, runtime, _manager, _state, _dir) = service();
+        for logo in [
+            "https://example.com/logo.png",
+            "data:image/gif;base64,R0lGODlh",
+            "data:text/html;base64,PGgxPg==",
+            "data:image/png,iVBORw0KGgo=",
+            "data:image/png;base64,not*base64",
+            "data:image/png;base64,abc",
+        ] {
+            let mut request = request(&service);
+            request.logo_data_url = Some(logo.into());
+            assert_bad_request(service.update(&admin(), request));
+        }
+        assert_eq!(runtime.get().logo_data_url, None);
+    }
+
+    #[test]
+    fn rejects_logo_over_200_kb() {
+        let (service, _runtime, _manager, _state, _dir) = service();
+        let prefix = "data:image/png;base64,";
+        let body_len = (MAX_LOGO_DATA_URL_BYTES - prefix.len()) / 4 * 4 + 4;
+        let mut request = request(&service);
+        request.logo_data_url = Some(format!("{prefix}{}", "A".repeat(body_len)));
+        assert_bad_request(service.update(&admin(), request));
+
+        let mut request = super::tests::request(&service);
+        let body_len = (MAX_LOGO_DATA_URL_BYTES - prefix.len()) / 4 * 4;
+        request.logo_data_url = Some(format!("{prefix}{}", "A".repeat(body_len)));
+        assert!(service.update(&admin(), request).is_ok());
+    }
+
+    #[test]
+    fn rejects_site_name_over_60_chars() {
+        let (service, _runtime, _manager, _state, _dir) = service();
+        let mut request = request(&service);
+        request.site_name = Some("站".repeat(61));
+        assert_bad_request(service.update(&admin(), request));
+        let mut request = super::tests::request(&service);
+        request.site_name = Some("站".repeat(60));
+        assert!(service.update(&admin(), request).is_ok());
     }
 }

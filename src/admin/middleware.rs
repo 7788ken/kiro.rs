@@ -14,6 +14,7 @@ use super::types::AdminErrorResponse;
 use super::{core_config, service::AdminService};
 use crate::accounts::{AccountState, middleware::authenticate_api_key};
 use crate::common::auth;
+use crate::kiro::version_check::VersionCheckService;
 
 /// Admin API 共享状态
 #[derive(Clone)]
@@ -26,6 +27,8 @@ pub struct AdminState {
     pub core_config: Arc<core_config::CoreConfigService>,
     /// 账户认证服务，支持 API Key 与密码登录的网页会话
     pub account_state: AccountState,
+    /// Kiro 客户端版本检测服务
+    pub version_check: Arc<VersionCheckService>,
 }
 
 impl AdminState {
@@ -34,12 +37,14 @@ impl AdminState {
         service: AdminService,
         account_state: AccountState,
         core_config: core_config::CoreConfigService,
+        version_check: Arc<VersionCheckService>,
     ) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
             account_state,
             core_config: Arc::new(core_config),
+            version_check,
         }
     }
 }

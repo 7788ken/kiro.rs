@@ -26,6 +26,7 @@ kiro-rs 蓝 / 绿容器（共享配置和 MySQL）
 - Linux x86_64 或 arm64。
 - Docker 与 Docker Compose v2。
 - 可访问 GitHub、容器镜像仓库和 Kiro 上游服务。
+- 出站需放行 `prod.download.desktop.kiro.dev`（后台 Kiro 客户端版本检测读取官方最新稳定版）；不放行时仍可按内置最低支持版本判断，只是无法显示最新版。
 - 使用公网服务时开放所选端口；不要把数据库端口暴露到公网。
 
 检查环境：

@@ -202,6 +202,20 @@ pub async fn get_core_config(
     Json(state.core_config.get()).into_response()
 }
 
+/// GET /api/admin/config/version-check
+///
+/// 返回 Kiro 客户端版本检测的缓存结果；任何已登录管理员可读
+pub async fn get_version_check(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.version_check.state())
+}
+
+/// POST /api/admin/config/version-check/refresh
+///
+/// 手动触发版本检测；60 秒内已检测过则返回缓存并标记 `throttled`
+pub async fn refresh_version_check(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.version_check.refresh_manual().await)
+}
+
 /// PUT /api/admin/config/core
 pub async fn update_core_config(
     State(state): State<AdminState>,

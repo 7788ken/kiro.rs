@@ -169,12 +169,17 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     spawn_proxy_health_checker(proxy_pool);
     let account_state = account_state.with_token_manager(token_manager.clone());
+    let version_check = Arc::new(kiro::version_check::VersionCheckService::new(
+        runtime_config.clone(),
+    ));
+    kiro::version_check::spawn_version_checker(version_check.clone());
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
+    )
+    .with_version_check(Some(version_check.clone()));
 
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
@@ -204,6 +209,7 @@ async fn main() {
             anthropic::shared_app_state().clone(),
             endpoint_names,
         ),
+        version_check,
     );
     let admin_app = admin::create_admin_router(admin_state.clone()).layer(
         middleware::from_fn_with_state(admin_state, admin::admin_auth_middleware),
@@ -214,6 +220,7 @@ async fn main() {
     let app = Router::new()
         .merge(lifecycle::router(lifecycle.clone()))
         .merge(anthropic_app)
+        .merge(accounts::branding_router(account_state.clone()))
         .nest(
             "/api/account",
             accounts::login_router(account_state.clone()),

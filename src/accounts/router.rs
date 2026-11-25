@@ -58,6 +58,29 @@ pub fn login_router(state: AccountState) -> Router {
         .with_state(state)
 }
 
+/// 公开品牌信息路由（不鉴权），挂在 `/api/branding`
+pub fn branding_router(state: AccountState) -> Router {
+    Router::new()
+        .route("/api/branding", get(get_branding))
+        .with_state(state)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrandingResponse {
+    site_name: Option<String>,
+    logo_data_url: Option<String>,
+}
+
+async fn get_branding(State(state): State<AccountState>) -> Response {
+    let config = state.token_manager.as_ref().map(|manager| manager.config());
+    Json(BrandingResponse {
+        site_name: config.as_ref().and_then(|config| config.site_name.clone()),
+        logo_data_url: config.and_then(|config| config.logo_data_url.clone()),
+    })
+    .into_response()
+}
+
 async fn logout(State(state): State<AccountState>, request: axum::extract::Request) -> Response {
     if let Some(token) = crate::common::auth::extract_api_key(&request) {
         let _ = state.store.revoke_web_session(&token);
@@ -254,5 +277,69 @@ fn respond<T: serde::Serialize>(result: Result<T, AccountError>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => error_response(error),
+    }
+}
+
+#[cfg(all(test, not(feature = "mysql")))]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{body::Body, http::Request, http::StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::accounts::AccountStore;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+
+    async fn get_branding_json(state: AccountState) -> (StatusCode, serde_json::Value) {
+        let response = branding_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/branding")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn branding_is_public_and_reflects_runtime_config() {
+        let store = Arc::new(AccountStore::open(":memory:").unwrap());
+        let mut config = Config::default();
+        config.site_name = Some("我的站点".into());
+        config.logo_data_url = Some("data:image/png;base64,iVBORw0KGgo=".into());
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::runtime_config::RuntimeConfig::from_config(config),
+                vec![],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let state = AccountState::new(store, "test-admin-key-123456").with_token_manager(manager);
+        let (status, body) = get_branding_json(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["siteName"], "我的站点");
+        assert_eq!(body["logoDataUrl"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    #[tokio::test]
+    async fn branding_defaults_to_null_without_config() {
+        let store = Arc::new(AccountStore::open(":memory:").unwrap());
+        let (status, body) =
+            get_branding_json(AccountState::new(store, "test-admin-key-123456")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({ "siteName": null, "logoDataUrl": null })
+        );
     }
 }
