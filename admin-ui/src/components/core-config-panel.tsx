@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { RefreshCw, Save, ShieldCheck } from 'lucide-react'
+import { ImageIcon, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react'
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
@@ -10,6 +10,7 @@ import { Input, formControlClass } from '@/components/ui/input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { PageSection } from '@/components/page-elements'
+import { DEFAULT_SITE_NAME } from '@/api/branding'
 
 type CoreConfig = {
   revision: number
@@ -26,6 +27,22 @@ type CoreConfig = {
   proxyUrl: string | null
   proxyUsername: string | null
   proxyPasswordSet: boolean
+  siteName: string | null
+  logoDataUrl: string | null
+}
+
+const LOGO_ACCEPT = 'image/svg+xml,image/png,image/jpeg,image/x-icon,image/webp'
+const LOGO_MIME_TYPES = LOGO_ACCEPT.split(',')
+const MAX_LOGO_BYTES = 200 * 1024
+const MAX_SITE_NAME_CHARS = 60
+
+function readAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
 }
 
 const api = axios.create({ baseURL: '/api/admin' })
@@ -42,14 +59,27 @@ export function CoreConfigPanel() {
   const [password, setPassword] = useState('')
   const [clearPassword, setClearPassword] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  // 新选择的 Logo（未保存）；clearLogo 表示保存时移除已有 Logo
+  const [newLogo, setNewLogo] = useState<string | null>(null)
+  const [clearLogo, setClearLogo] = useState(false)
   useEffect(() => { if (query.data) setForm(query.data) }, [query.data])
   const mutation = useMutation({
-    mutationFn: async (config: CoreConfig) => (await api.put<CoreConfig>('/config/core', { ...config, proxyPassword: password || undefined, clearProxyPassword: clearPassword })).data,
+    mutationFn: async (config: CoreConfig) => (await api.put<CoreConfig>('/config/core', {
+      ...config,
+      siteName: config.siteName ?? '',
+      logoDataUrl: clearLogo ? undefined : newLogo ?? undefined,
+      clearLogo,
+      proxyPassword: password || undefined,
+      clearProxyPassword: clearPassword,
+    })).data,
     onSuccess: result => {
       setForm(result)
       setPassword('')
       setClearPassword(false)
+      setNewLogo(null)
+      setClearLogo(false)
       queryClient.invalidateQueries({ queryKey: ['core-config'] })
+      queryClient.invalidateQueries({ queryKey: ['branding'] })
       toast.success(`配置已保存并热重载，新请求立即生效（版本 ${result.revision}）`)
     },
     onError: error => toast.error(extractErrorMessage(error)),
@@ -61,8 +91,29 @@ export function CoreConfigPanel() {
     if (!form.region.trim() || !form.kiroVersion.trim() || !form.systemVersion.trim() || !form.nodeVersion.trim()) return toast.error('Region 与客户端版本标识不能为空')
     setConfirmOpen(true)
   }
+  const logoPreview = clearLogo ? null : newLogo ?? form.logoDataUrl
+  const pickLogo = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!LOGO_MIME_TYPES.includes(file.type)) return toast.error('Logo 仅支持 SVG、PNG、JPEG、ICO、WebP 格式')
+    try {
+      const dataUrl = await readAsDataUrl(file)
+      if (dataUrl.length > MAX_LOGO_BYTES) return toast.error('Logo 不能超过 200 KB，请压缩后再上传')
+      setNewLogo(dataUrl)
+      setClearLogo(false)
+    } catch (error) { toast.error(`读取 Logo 失败：${extractErrorMessage(error)}`) }
+  }
+  const removeLogo = () => {
+    setNewLogo(null)
+    setClearLogo(Boolean(form.logoDataUrl))
+  }
   return <PageSection title="核心配置" description="保存后原子写入配置并热重载，新请求使用新配置；进行中的流式响应不受影响。" actions={<div className="flex items-center gap-2"><span className="text-xs tabular-nums text-muted-foreground">运行版本 {form.revision}</span><Button variant="ghost" size="icon" title="重新读取配置" aria-label="重新读取配置" onClick={() => query.refetch()} disabled={query.isFetching}><RefreshCw className={query.isFetching ? 'animate-spin' : ''} /></Button></div>}>
     <form onSubmit={submit} className="space-y-5">
+      <Card><CardHeader><CardTitle className="flex items-center gap-2 text-base"><ImageIcon className="h-4 w-4" />品牌</CardTitle><CardDescription>站点名称和 Logo 显示在后台页头、登录页和浏览器标题，保存后立即生效。</CardDescription></CardHeader><CardContent className="grid gap-4 md:grid-cols-2">
+        <div className="space-y-2"><label htmlFor="core-site-name" className="text-sm font-medium">站点名称（留空使用默认）</label><Input id="core-site-name" value={form.siteName || ''} onChange={event => update('siteName', event.target.value || null)} placeholder={DEFAULT_SITE_NAME} maxLength={MAX_SITE_NAME_CHARS} /></div>
+        <div className="space-y-2"><label htmlFor="core-logo" className="text-sm font-medium">Logo（SVG / PNG / JPEG / ICO / WebP，不超过 200 KB）</label><div className="flex items-center gap-3">{logoPreview ? <img src={logoPreview} alt="Logo 预览" className="h-16 w-16 shrink-0 rounded-xl border object-contain" /> : <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-xl border border-dashed text-xs text-muted-foreground">默认</div>}<div className="flex flex-wrap gap-2"><Input id="core-logo" type="file" accept={LOGO_ACCEPT} onChange={pickLogo} className="max-w-[240px]" />{logoPreview && <Button type="button" variant="outline" size="sm" onClick={removeLogo}><Trash2 />移除 Logo</Button>}</div></div>{clearLogo && <p className="text-xs text-muted-foreground">保存后将移除已有 Logo。</p>}</div>
+      </CardContent></Card>
       <Card><CardHeader><CardTitle className="flex items-center gap-2 text-base"><ShieldCheck className="h-4 w-4" />Kiro 上游与客户端</CardTitle><CardDescription>版本与区域会影响后续上游请求；凭据级独立配置仍优先于全局回退值。</CardDescription></CardHeader><CardContent className="grid gap-4 md:grid-cols-2">
         <Field id="core-region" label="默认 Region" value={form.region} onChange={value => update('region', value)} required />
         <Field id="core-kiro-version" label="Kiro 客户端版本" value={form.kiroVersion} onChange={value => update('kiroVersion', value)} required />
@@ -85,7 +136,7 @@ export function CoreConfigPanel() {
       </CardContent></Card>
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/35 px-4 py-3"><p className="text-pretty text-xs leading-5 text-muted-foreground">密钥、管理员密码、数据库地址和监听地址不会在此页面展示或修改。若其他管理员已保存新版本，系统会要求先刷新，避免覆盖。</p><Button type="submit" disabled={mutation.isPending}><Save />{mutation.isPending ? '保存中…' : '保存并热重载'}</Button></div>
     </form>
-    {confirmOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="core-confirm-title"><Card className="w-full max-w-md"><CardHeader><CardTitle id="core-confirm-title">确认切换核心配置？</CardTitle><CardDescription>保存后立即对新请求生效。Region、Kiro 版本、端点、代理或 TLS 的变化可能影响上游连通性，请确认当前填写内容。</CardDescription></CardHeader><CardContent><div className="mb-4 space-y-1 text-sm"><p>Region：<span className="font-mono">{form.region}</span></p><p>Kiro 版本：<span className="font-mono">{form.kiroVersion}</span></p><p>默认端点：<span className="font-mono">{form.defaultEndpoint}</span></p><p>全局代理：<span className="font-mono">{form.proxyUrl || '直连'}</span></p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setConfirmOpen(false)}>返回检查</Button><Button onClick={() => { setConfirmOpen(false); mutation.mutate(form) }}>确认保存并切换</Button></div></CardContent></Card></div>}
+    {confirmOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="core-confirm-title"><Card className="w-full max-w-md"><CardHeader><CardTitle id="core-confirm-title">确认切换核心配置？</CardTitle><CardDescription>保存后立即对新请求生效。Region、Kiro 版本、端点、代理或 TLS 的变化可能影响上游连通性，请确认当前填写内容。</CardDescription></CardHeader><CardContent><div className="mb-4 space-y-1 text-sm"><p>站点名称：<span className="font-mono">{form.siteName?.trim() || DEFAULT_SITE_NAME}</span></p><p>Region：<span className="font-mono">{form.region}</span></p><p>Kiro 版本：<span className="font-mono">{form.kiroVersion}</span></p><p>默认端点：<span className="font-mono">{form.defaultEndpoint}</span></p><p>全局代理：<span className="font-mono">{form.proxyUrl || '直连'}</span></p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setConfirmOpen(false)}>返回检查</Button><Button onClick={() => { setConfirmOpen(false); mutation.mutate(form) }}>确认保存并切换</Button></div></CardContent></Card></div>}
   </PageSection>
 }
 

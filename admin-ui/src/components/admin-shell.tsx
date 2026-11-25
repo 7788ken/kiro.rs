@@ -3,6 +3,7 @@ import { KeyRound, LogOut, Menu, Moon, Sun, X } from 'lucide-react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { useBranding } from '@/hooks/use-branding'
 import { sectionMeta, sectionNavItems, sectionPath, type AdminSection } from '@/lib/navigation'
 export type { AdminSection } from '@/lib/navigation'
 
@@ -23,6 +24,7 @@ export function roleName(role: string) {
 export function AdminShell({ section, onSectionChange, username, role, isManager, onLogout, children }: AdminShellProps) {
   const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
   const [mobileOpen, setMobileOpen] = useState(false)
+  const { siteName } = useBranding()
 
   useEffect(() => {
     const saved = localStorage.getItem('kiro-admin-theme')
@@ -47,8 +49,8 @@ export function AdminShell({ section, onSectionChange, username, role, isManager
   const meta = sectionMeta[section]
 
   useEffect(() => {
-    document.title = `${meta.title} · Kiro Console`
-  }, [meta.title])
+    document.title = `${meta.title} · ${siteName}`
+  }, [meta.title, siteName])
 
   return (
     <div className="min-h-screen overflow-x-clip bg-background text-foreground antialiased">
@@ -81,7 +83,7 @@ export function AdminShell({ section, onSectionChange, username, role, isManager
 
       <div className="lg:pl-[232px]">
         <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b bg-background/90 px-4 backdrop-blur-md sm:px-6 lg:px-8">
-          <div className="flex items-center gap-2"><Button variant="ghost" size="icon" className="lg:hidden" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Menu /></Button><span className="text-sm font-medium text-muted-foreground">Kiro Console<span className="mx-2 text-border">/</span><span className="text-foreground">{meta.title}</span></span></div>
+          <div className="flex items-center gap-2"><Button variant="ghost" size="icon" className="lg:hidden" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Menu /></Button><span className="text-sm font-medium text-muted-foreground">{siteName}<span className="mx-2 text-border">/</span><span className="text-foreground">{meta.title}</span></span></div>
           <Button variant="ghost" size="icon" title={dark ? '切换浅色模式' : '切换深色模式'} aria-label={dark ? '切换浅色模式' : '切换深色模式'} onClick={toggleTheme}>{dark ? <Sun /> : <Moon />}</Button>
         </header>
         <main className="mx-auto w-full max-w-[1600px] px-4 py-7 sm:px-6 lg:px-8 lg:py-9">
@@ -94,7 +96,8 @@ export function AdminShell({ section, onSectionChange, username, role, isManager
 }
 
 function Brand() {
-  return <div className="flex h-16 items-center gap-3 px-5"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm"><KeyRound className="h-[18px] w-[18px]" /></div><div><div className="text-[15px] font-semibold tracking-[-0.02em]">Kiro Console</div><div className="text-[11px] text-muted-foreground">服务管理中心</div></div></div>
+  const { siteName, logoDataUrl } = useBranding()
+  return <div className="flex h-16 min-w-0 items-center gap-3 px-5">{logoDataUrl ? <img src={logoDataUrl} alt="" className="h-9 w-9 shrink-0 rounded-xl object-contain" /> : <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm"><KeyRound className="h-[18px] w-[18px]" /></div>}<div className="min-w-0"><div className="truncate text-[15px] font-semibold tracking-[-0.02em]" title={siteName}>{siteName}</div><div className="text-[11px] text-muted-foreground">服务管理中心</div></div></div>
 }
 
 function NavItem({ id, label, icon: Icon, active, onClick }: { id: AdminSection; label: string; icon: typeof import('lucide-react').Wallet; active: boolean; onClick: () => void }) {

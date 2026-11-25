@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { getAccount, logoutAccount } from '@/api/accounts'
 import { storage } from '@/lib/storage'
+import { useBranding } from '@/hooks/use-branding'
 import { LoginPage } from '@/components/login-page'
 import { Dashboard } from '@/components/dashboard'
 import { AccountDashboard } from '@/components/account-dashboard'
@@ -24,6 +25,7 @@ function App() {
   const [requestedPath, setRequestedPath] = useState<string | null>(null)
   const section = useAdminSection()
   const queryClient = useQueryClient()
+  const { siteName } = useBranding()
   const accountQuery = useQuery({
     queryKey: ['account-session'],
     queryFn: getAccount,
@@ -74,6 +76,12 @@ function App() {
   useEffect(() => {
     if (section && role && !accessible) navigateTo(sectionPath('overview'), true)
   }, [section, role, accessible])
+
+  // 后台外壳内由 AdminShell 设置「页面 · 站点名」标题，其余页面（登录、加载）只显示站点名
+  const inShell = Boolean(account && section)
+  useEffect(() => {
+    if (!inShell) document.title = siteName
+  }, [inShell, siteName])
 
   return (
     <>

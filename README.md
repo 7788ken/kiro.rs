@@ -59,6 +59,8 @@ KAM 平铺和嵌套格式导入会保留企业 IdC 的 `profileArn`、Auth Regio
 
 超管可在「安全与设置 → 核心配置」实时修改 Region、Kiro 客户端版本、默认端点、负载均衡、TLS 后端、非流式 Thinking 提取与全局代理。保存经校验后原子写入 `config.json` 并热重载运行时配置，新请求使用新快照，存量流式响应继续使用旧快照。密钥、管理员密码、数据库地址和监听地址不在此页面展示或修改；代理密码留空保留，不会通过接口回显。配置带有版本号，冲突时拒绝覆盖其他管理员的修改。
 
+核心配置页的「品牌」卡片可设置站点名称（最多 60 字）和 Logo（SVG、PNG、JPEG、ICO 或 WebP，data URL 整串不超过 200 KB）。两项写入 `config.json` 的 `siteName` 与 `logoDataUrl`，显示在后台侧栏、页头、登录页和浏览器标题；留空站点名称使用默认的 `Kiro Console`。公开接口 `GET /api/branding` 不鉴权，仅返回这两个字段，供登录页在登录前读取。
+
 ### 账户 API
 
 - `GET /api/account/me`：个人账户、余额与用量概览。

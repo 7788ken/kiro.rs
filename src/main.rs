@@ -214,6 +214,7 @@ async fn main() {
     let app = Router::new()
         .merge(lifecycle::router(lifecycle.clone()))
         .merge(anthropic_app)
+        .merge(accounts::branding_router(account_state.clone()))
         .nest(
             "/api/account",
             accounts::login_router(account_state.clone()),
