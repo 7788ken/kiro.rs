@@ -14,18 +14,19 @@ use super::conversation::ConversationState;
 ///
 /// ```rust
 /// use kiro_rs::kiro::model::requests::{
-///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
+///     ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
 /// };
 ///
 /// // 创建简单请求
 /// let state = ConversationState::new("conv-123")
 ///     .with_agent_task_type("vibe")
 ///     .with_current_message(CurrentMessage::new(
-///         UserInputMessage::new("Hello", "claude-3-5-sonnet")
+///         UserInputMessage::new("Hello", "claude-sonnet-4.5")
 ///     ));
 ///
-/// let request = KiroRequest::new(state);
-/// let json = request.to_json().unwrap();
+/// let request = KiroRequest { conversation_state: state, profile_arn: None };
+/// let json = serde_json::to_string(&request).unwrap();
+/// assert!(json.contains("\"conversationId\":\"conv-123\""));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
