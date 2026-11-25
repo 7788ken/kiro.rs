@@ -6,7 +6,8 @@
 //! 规则：
 //! - 断点按 `tools` → `system` → `messages`（逐 content block）顺序扫描，带 `cache_control` 的位置记为断点，只取最后 4 个；
 //! - 断点键 = 该断点及之前所有段落内容的稳定哈希（哈希前去掉 `cache_control` 本身，断点移动不影响前缀）；
-//! - 缓存表 TTL 5 分钟，从最后一个断点往前找第一个未过期的命中：命中前缀记为读取，
+//! - 缓存表 TTL 5 分钟，只写入断点；查找时从最后一个断点及其之前最多 20 个 block 边界、
+//!   再加更早的断点里，按前缀从长到短找第一个未过期的命中：命中前缀记为读取，
 //!   命中位置到最后断点之间记为写入，其余记为普通输入。
 
 use std::collections::HashMap;
@@ -24,6 +25,8 @@ use crate::token;
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// 每个请求最多生效的断点数
 const MAX_BREAKPOINTS: usize = 4;
+/// 查找命中时从最后断点往前回看的 block 边界数（与官方约 20 个一致）
+const LOOKBACK_BOUNDARIES: usize = 20;
 /// 缓存表超过此条数时，插入前先清理过期项
 const MAX_ENTRIES_BEFORE_PRUNE: usize = 10_000;
 
@@ -115,11 +118,12 @@ pub fn simulate(payload: &MessagesRequest) -> CacheSplit {
     CACHE.simulate_at(payload, Instant::now())
 }
 
-/// 一个断点：前缀哈希 + 前缀本地 token 数
+/// 一个 block 边界：前缀哈希 + 前缀本地 token 数 + 是否为断点（带 `cache_control`）
 #[derive(Debug, Clone, Copy)]
-struct Breakpoint {
+struct Boundary {
     key: u64,
     prefix_tokens: i64,
+    is_breakpoint: bool,
 }
 
 struct PromptCache {
@@ -134,19 +138,35 @@ impl PromptCache {
     }
 
     fn simulate_at(&self, payload: &MessagesRequest, now: Instant) -> CacheSplit {
-        let (mut breakpoints, total_local) = scan_breakpoints(payload);
-        if breakpoints.is_empty() {
+        let (boundaries, total_local) = scan_breakpoints(payload);
+        // 断点在 boundaries 里的下标，只取最后 MAX_BREAKPOINTS 个
+        let mut breakpoint_indices: Vec<usize> = boundaries
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_breakpoint)
+            .map(|(i, _)| i)
+            .collect();
+        if breakpoint_indices.is_empty() {
             return CacheSplit::none(total_local);
         }
-        if breakpoints.len() > MAX_BREAKPOINTS {
-            breakpoints.drain(..breakpoints.len() - MAX_BREAKPOINTS);
+        if breakpoint_indices.len() > MAX_BREAKPOINTS {
+            breakpoint_indices.drain(..breakpoint_indices.len() - MAX_BREAKPOINTS);
         }
-        let last_prefix = breakpoints.last().map(|b| b.prefix_tokens).unwrap_or(0);
+        let last_index = *breakpoint_indices.last().unwrap();
+        let last_prefix = boundaries[last_index].prefix_tokens;
+
+        // 候选命中位置：最后断点及其前 LOOKBACK_BOUNDARIES 个边界，再加更早的断点。
+        // 前缀 token 数随位置单调不减，按位置倒序即按 prefix_tokens 从大到小。
+        let mut candidates: Vec<usize> =
+            (last_index.saturating_sub(LOOKBACK_BOUNDARIES)..=last_index).collect();
+        candidates.extend(breakpoint_indices.iter().copied());
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        candidates.dedup();
 
         let mut entries = self.entries.lock();
-        let read_local = breakpoints
+        let read_local = candidates
             .iter()
-            .rev()
+            .map(|&i| &boundaries[i])
             .find(|b| {
                 entries
                     .get(&b.key)
@@ -158,8 +178,8 @@ impl PromptCache {
         if entries.len() > MAX_ENTRIES_BEFORE_PRUNE {
             entries.retain(|_, at| now.saturating_duration_since(*at) < CACHE_TTL);
         }
-        for breakpoint in &breakpoints {
-            entries.insert(breakpoint.key, now);
+        for &i in &breakpoint_indices {
+            entries.insert(boundaries[i].key, now);
         }
 
         CacheSplit {
@@ -170,15 +190,18 @@ impl PromptCache {
     }
 }
 
-/// 按官方顺序扫描断点，返回（全部断点，本地口径总 token 数）
-fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
+/// 按官方顺序扫描，返回（每个 block 边界，本地口径总 token 数）。
+///
+/// tools 每个 tool、system 每个 block、messages 每个 block（字符串消息整条算一个）各是一个边界。
+fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
     let mut hasher = DefaultHasher::new();
     let mut tokens: i64 = 0;
-    let mut breakpoints = Vec::new();
-    let mut push_breakpoint = |hasher: &DefaultHasher, tokens: i64| {
-        breakpoints.push(Breakpoint {
+    let mut boundaries = Vec::new();
+    let mut push_boundary = |hasher: &DefaultHasher, tokens: i64, is_breakpoint: bool| {
+        boundaries.push(Boundary {
             key: hasher.clone().finish(),
             prefix_tokens: tokens,
+            is_breakpoint,
         });
     };
 
@@ -189,9 +212,7 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
             stable_json(value).hash(&mut hasher);
             tokens += count(&tool.name) + count(&tool.description);
             tokens += count(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
-            if has_cache_control(tool.cache_control.as_ref()) {
-                push_breakpoint(&hasher, tokens);
-            }
+            push_boundary(&hasher, tokens, has_cache_control(tool.cache_control.as_ref()));
         }
     }
 
@@ -201,9 +222,7 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
             let value = serde_json::to_value(block).unwrap_or(Value::Null);
             stable_json(value).hash(&mut hasher);
             tokens += count(&block.text);
-            if has_cache_control(block.cache_control.as_ref()) {
-                push_breakpoint(&hasher, tokens);
-            }
+            push_boundary(&hasher, tokens, has_cache_control(block.cache_control.as_ref()));
         }
     }
 
@@ -217,9 +236,7 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
                         tokens += count(text);
                     }
-                    if has_cache_control(block.get("cache_control")) {
-                        push_breakpoint(&hasher, tokens);
-                    }
+                    push_boundary(&hasher, tokens, has_cache_control(block.get("cache_control")));
                 }
             }
             other => {
@@ -229,11 +246,12 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
                 if let Value::String(text) = other {
                     tokens += count(text);
                 }
+                push_boundary(&hasher, tokens, false);
             }
         }
     }
 
-    (breakpoints, tokens)
+    (boundaries, tokens)
 }
 
 fn count(text: &str) -> i64 {
@@ -410,6 +428,74 @@ mod tests {
         }));
         cache.simulate_at(&payload, Instant::now());
         assert_eq!(cache.entries.lock().len(), MAX_BREAKPOINTS);
+    }
+
+    const SYSTEM_TEXTS: [&str; 2] = ["you are claude code", "project instructions"];
+
+    /// 模拟 Claude Code：system 两块（第二块带断点）+ `message_count` 条单 block 消息，
+    /// 只有最后一条消息的 block 带断点
+    fn claude_code_request(message_count: usize) -> MessagesRequest {
+        let messages: Vec<Value> = (0..message_count)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                let mut block = json!({"type": "text", "text": long_text(&format!("message {i}"))});
+                if i + 1 == message_count {
+                    block["cache_control"] = json!({"type": "ephemeral"});
+                }
+                json!({"role": role, "content": [block]})
+            })
+            .collect();
+        request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": long_text(SYSTEM_TEXTS[0])},
+                {"type": "text", "text": long_text(SYSTEM_TEXTS[1]), "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": messages
+        }))
+    }
+
+    fn system_prefix_tokens() -> i64 {
+        SYSTEM_TEXTS.iter().map(|t| count(&long_text(t))).sum()
+    }
+
+    #[test]
+    fn moved_breakpoint_reads_previous_turn_prefix() {
+        let cache = PromptCache::new();
+        let start = Instant::now();
+        let round1 = claude_code_request(5);
+        let round2 = claude_code_request(7);
+
+        let first = cache.simulate_at(&round1, start);
+        assert_eq!(first.read_local, 0);
+        assert_eq!(first.creation_local, first.total_local);
+
+        let second = cache.simulate_at(&round2, start + Duration::from_secs(30));
+        assert!(first.total_local > system_prefix_tokens());
+        assert_eq!(second.read_local, first.total_local);
+        assert_eq!(second.creation_local, second.total_local - first.total_local);
+        assert_eq!(second.total_local, local_total(&round2));
+    }
+
+    #[test]
+    fn lookback_is_limited_to_twenty_boundaries() {
+        let start = Instant::now();
+        let round1 = claude_code_request(5);
+
+        // 旧断点在本轮最后断点之前 20 个边界：仍在回看范围内，命中
+        let cache = PromptCache::new();
+        let first = cache.simulate_at(&round1, start);
+        let within = cache.simulate_at(&claude_code_request(5 + 20), start + Duration::from_secs(30));
+        assert_eq!(within.read_local, first.total_local);
+
+        // 旧断点在本轮最后断点之前 25 个边界：超出回看范围，回退到 system 断点
+        let cache = PromptCache::new();
+        cache.simulate_at(&round1, start);
+        let round2 = claude_code_request(5 + 25);
+        let beyond = cache.simulate_at(&round2, start + Duration::from_secs(30));
+        assert_eq!(beyond.read_local, system_prefix_tokens());
+        assert_eq!(beyond.creation_local, beyond.total_local - system_prefix_tokens());
     }
 
     #[test]
