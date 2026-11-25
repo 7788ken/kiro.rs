@@ -223,6 +223,8 @@ struct BillingGuard {
     first_token_ms: Option<i64>,
     input_tokens: i64,
     output_tokens: i64,
+    cache_creation_input_tokens: i64,
+    cache_read_input_tokens: i64,
     buffer: Vec<u8>,
     error_message: Option<String>,
     live: Option<crate::admin::TrackedRequestGuard>,
@@ -255,6 +257,8 @@ impl BillingGuard {
             first_token_ms: None,
             input_tokens: 0,
             output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             buffer: Vec::new(),
             error_message: None,
             live: Some(live),
@@ -341,6 +345,15 @@ impl BillingGuard {
         if let Some(output) = usage.get("output_tokens").and_then(Value::as_i64) {
             self.output_tokens = self.output_tokens.max(output.max(0));
         }
+        if let Some(creation) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64)
+        {
+            self.cache_creation_input_tokens = self.cache_creation_input_tokens.max(creation.max(0));
+        }
+        if let Some(read) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
+            self.cache_read_input_tokens = self.cache_read_input_tokens.max(read.max(0));
+        }
         if let Some(credits) = usage.get("credential_credits").and_then(Value::as_f64) {
             if credits.is_finite() && credits >= 0.0 {
                 self.reported_credits = Some(credits);
@@ -388,8 +401,12 @@ impl BillingGuard {
             self.record_error(&message);
         }
         if let Some(reservation) = self.reservation.take() {
-            let input = if self.input_tokens > 0 {
-                self.input_tokens
+            // input_tokens 列记总输入量（普通输入 + 缓存写入 + 缓存读取），保持原统计口径
+            let captured_input = self.input_tokens
+                + self.cache_creation_input_tokens
+                + self.cache_read_input_tokens;
+            let input = if captured_input > 0 {
+                captured_input
             } else {
                 reservation.input_tokens
             };
@@ -401,6 +418,8 @@ impl BillingGuard {
                 error_message: self.error_message.clone(),
                 duration_ms: elapsed_ms(self.started_at),
                 first_token_ms: self.first_token_ms,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_read_input_tokens: self.cache_read_input_tokens,
             };
             if let Some(live) = self.live.take() {
                 live.finish(

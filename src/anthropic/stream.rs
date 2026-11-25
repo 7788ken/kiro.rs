@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::prompt_cache::{CacheSplit, UsageTokens};
 use crate::accounts::models::CredentialUsage;
 use crate::kiro::model::events::Event;
 
@@ -451,7 +452,7 @@ impl SseStateManager {
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
-        input_tokens: i32,
+        usage: UsageTokens,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -481,10 +482,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage.to_usage_json(output_tokens)
                 }),
             ));
         }
@@ -539,6 +537,8 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 上游 metering 事件写入这里，供计费中间件按凭证真实消耗结算
     credential_usage: CredentialUsage,
+    /// 本地模拟的 prompt cache 拆分（只用于 usage 展示）
+    pub cache_split: CacheSplit,
 }
 
 impl StreamContext {
@@ -566,12 +566,18 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             credential_usage: CredentialUsage::new(),
+            cache_split: CacheSplit::none(i64::from(input_tokens)),
         }
     }
 
     /// 绑定本次请求的凭证消耗收集器。后到的 metering 事件覆盖先前的值。
     pub fn set_credential_usage(&mut self, usage: CredentialUsage) {
         self.credential_usage = usage;
+    }
+
+    /// 设置本次请求的 prompt cache 模拟结果
+    pub fn set_cache_split(&mut self, cache_split: CacheSplit) {
+        self.cache_split = cache_split;
     }
 
     /// 生成 message_start 事件
@@ -586,10 +592,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": self.cache_split.apply(self.input_tokens).to_usage_json(1)
             }
         })
     }
@@ -1146,9 +1149,10 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
+        let usage = self.cache_split.apply(final_input_tokens);
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(usage, self.output_tokens),
         );
         events
     }
@@ -1202,6 +1206,11 @@ impl BufferedStreamContext {
         self.inner.set_credential_usage(usage);
     }
 
+    /// 设置本次请求的 prompt cache 模拟结果
+    pub fn set_cache_split(&mut self, cache_split: CacheSplit) {
+        self.inner.set_cache_split(cache_split);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1242,12 +1251,17 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 input_tokens 及缓存字段
+        let usage_tokens = self.inner.cache_split.apply(final_input_tokens);
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = json!(usage_tokens.input_tokens);
+                        usage["cache_creation_input_tokens"] =
+                            json!(usage_tokens.cache_creation_input_tokens);
+                        usage["cache_read_input_tokens"] =
+                            json!(usage_tokens.cache_read_input_tokens);
                     }
                 }
             }
@@ -1309,6 +1323,50 @@ mod tests {
             },
         ));
         assert_eq!(usage.get(), Some(0.25));
+    }
+
+    fn usage_of<'a>(events: &'a [SseEvent], name: &str) -> &'a serde_json::Value {
+        let event = events.iter().find(|e| e.event == name).unwrap();
+        event
+            .data
+            .pointer("/message/usage")
+            .or_else(|| event.data.get("usage"))
+            .unwrap()
+    }
+
+    #[test]
+    fn stream_usage_includes_simulated_cache_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 1000, false, HashMap::new());
+        ctx.set_cache_split(CacheSplit::from_parts(1000, 600, 300));
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.generate_final_events());
+
+        let start = usage_of(&events, "message_start");
+        assert_eq!(start["input_tokens"], 100);
+        assert_eq!(start["cache_read_input_tokens"], 600);
+        assert_eq!(start["cache_creation_input_tokens"], 300);
+        let delta = usage_of(&events, "message_delta");
+        assert_eq!(delta["input_tokens"], 100);
+        assert_eq!(delta["cache_read_input_tokens"], 600);
+        assert_eq!(delta["cache_creation_input_tokens"], 300);
+    }
+
+    #[test]
+    fn buffered_stream_rescales_message_start_usage() {
+        let mut ctx = BufferedStreamContext::new("claude-sonnet-4-6", 1000, false, HashMap::new());
+        ctx.set_cache_split(CacheSplit::from_parts(1000, 600, 300));
+        ctx.inner.context_input_tokens = Some(2000);
+        let events = ctx.finish_and_get_all_events();
+
+        let start = usage_of(&events, "message_start");
+        assert_eq!(start["input_tokens"], 200);
+        assert_eq!(start["cache_read_input_tokens"], 1200);
+        assert_eq!(start["cache_creation_input_tokens"], 600);
+        let delta = usage_of(&events, "message_delta");
+        assert_eq!(delta["input_tokens"], 200);
+        assert_eq!(delta["cache_read_input_tokens"], 1200);
+        assert_eq!(delta["cache_creation_input_tokens"], 600);
     }
 
     #[test]

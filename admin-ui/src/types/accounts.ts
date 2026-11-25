@@ -42,6 +42,8 @@ export interface CreditTransaction {
   model?: string
   inputTokens: number
   outputTokens: number
+  cacheCreationInputTokens: number
+  cacheReadInputTokens: number
   reservedMicro: number
   status: 'pending' | 'settled' | 'processing'
   note?: string

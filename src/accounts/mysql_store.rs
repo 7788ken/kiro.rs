@@ -37,7 +37,7 @@ impl MySqlStore {
         for statement in [
             "CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY AUTO_INCREMENT, username VARCHAR(191) NOT NULL, password_hash VARCHAR(255) NOT NULL, api_key_hash VARCHAR(64) NOT NULL UNIQUE, key_prefix VARCHAR(191) NOT NULL, role VARCHAR(20) NOT NULL CHECK (role IN ('super_admin', 'admin', 'user')), balance_micro BIGINT NOT NULL DEFAULT 0 CHECK (balance_micro >= 0), enabled TINYINT NOT NULL DEFAULT 1, created_at VARCHAR(64) NOT NULL, parent_id BIGINT NULL, UNIQUE KEY uq_users_username (username)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS billing_config (id TINYINT PRIMARY KEY CHECK (id = 1), input_per_million DOUBLE NOT NULL, output_per_million DOUBLE NOT NULL, consumption_ratio DOUBLE NOT NULL DEFAULT 1.0) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-            "CREATE TABLE IF NOT EXISTS credit_transactions (id VARCHAR(64) PRIMARY KEY, user_id BIGINT NOT NULL, actor_id BIGINT NULL, kind VARCHAR(32) NOT NULL, amount_micro BIGINT NOT NULL, balance_after_micro BIGINT NOT NULL, model VARCHAR(191) NULL, input_tokens BIGINT NOT NULL DEFAULT 0, output_tokens BIGINT NOT NULL DEFAULT 0, reserved_micro BIGINT NOT NULL DEFAULT 0, input_rate DOUBLE NOT NULL DEFAULT 10.0, output_rate DOUBLE NOT NULL DEFAULT 50.0, status VARCHAR(32) NOT NULL, note TEXT NULL, created_at VARCHAR(64) NOT NULL, completed_at VARCHAR(64) NULL, request_id VARCHAR(64) NULL, path VARCHAR(255) NULL, stream TINYINT NOT NULL DEFAULT 0, balance_before_micro BIGINT NULL, reserved_balance_micro BIGINT NULL, http_status INT NULL, error_message TEXT NULL, duration_ms BIGINT NULL, first_token_ms BIGINT NULL, consumption_ratio DOUBLE NOT NULL DEFAULT 1.0, credential_id BIGINT NULL, CONSTRAINT fk_transactions_user FOREIGN KEY (user_id) REFERENCES users(id), CONSTRAINT fk_transactions_actor FOREIGN KEY (actor_id) REFERENCES users(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            "CREATE TABLE IF NOT EXISTS credit_transactions (id VARCHAR(64) PRIMARY KEY, user_id BIGINT NOT NULL, actor_id BIGINT NULL, kind VARCHAR(32) NOT NULL, amount_micro BIGINT NOT NULL, balance_after_micro BIGINT NOT NULL, model VARCHAR(191) NULL, input_tokens BIGINT NOT NULL DEFAULT 0, output_tokens BIGINT NOT NULL DEFAULT 0, reserved_micro BIGINT NOT NULL DEFAULT 0, input_rate DOUBLE NOT NULL DEFAULT 10.0, output_rate DOUBLE NOT NULL DEFAULT 50.0, status VARCHAR(32) NOT NULL, note TEXT NULL, created_at VARCHAR(64) NOT NULL, completed_at VARCHAR(64) NULL, request_id VARCHAR(64) NULL, path VARCHAR(255) NULL, stream TINYINT NOT NULL DEFAULT 0, balance_before_micro BIGINT NULL, reserved_balance_micro BIGINT NULL, http_status INT NULL, error_message TEXT NULL, duration_ms BIGINT NULL, first_token_ms BIGINT NULL, consumption_ratio DOUBLE NOT NULL DEFAULT 1.0, credential_id BIGINT NULL, cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0, cache_read_input_tokens BIGINT NOT NULL DEFAULT 0, CONSTRAINT fk_transactions_user FOREIGN KEY (user_id) REFERENCES users(id), CONSTRAINT fk_transactions_actor FOREIGN KEY (actor_id) REFERENCES users(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS web_sessions (token_hash VARCHAR(64) PRIMARY KEY, user_id BIGINT NOT NULL, expires_at VARCHAR(64) NOT NULL, CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE INDEX idx_transactions_user ON credit_transactions(user_id, created_at DESC)",
             "CREATE INDEX idx_transactions_pending ON credit_transactions(status)",
@@ -71,6 +71,16 @@ impl MySqlStore {
                 "DOUBLE NOT NULL DEFAULT 1.0",
             ),
             ("credit_transactions", "credential_id", "BIGINT NULL"),
+            (
+                "credit_transactions",
+                "cache_creation_input_tokens",
+                "BIGINT NOT NULL DEFAULT 0",
+            ),
+            (
+                "credit_transactions",
+                "cache_read_input_tokens",
+                "BIGINT NOT NULL DEFAULT 0",
+            ),
         ] {
             let exists: Option<i64> = connection.exec_first("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?", (table, column)).map_err(mysql_error)?;
             if exists.unwrap_or(0) == 0 {

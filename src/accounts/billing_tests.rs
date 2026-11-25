@@ -160,6 +160,35 @@ async fn charges_actual_usage_from_sse_response() {
 }
 
 #[tokio::test]
+async fn records_cache_tokens_without_changing_charge() {
+    let (state, key, id) = user_fixture();
+    let response = Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":60,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":60,\"output_tokens\":100,\"credential_credits\":0.25}}\n\n",
+        )))
+        .unwrap();
+    let response = app(state.clone(), response)
+        .oneshot(request(&key, json!({"model":"claude-sonnet-4-6","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hello"}]})))
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+    assert_eq!(
+        state.store.get_user_view(id).unwrap().balance_micro,
+        750_000
+    );
+    let logs = transactions(&state, &key);
+    assert_eq!(logs.len(), 1);
+    // input_tokens 列记总量 = 普通输入 + 缓存写入 + 缓存读取
+    assert_eq!(logs[0].input_tokens, 100);
+    assert_eq!(logs[0].output_tokens, 100);
+    assert_eq!(logs[0].cache_creation_input_tokens, 30);
+    assert_eq!(logs[0].cache_read_input_tokens, 60);
+    assert_eq!(logs[0].amount_micro, -250_000);
+}
+
+#[tokio::test]
 async fn refunds_failed_upstream_request_and_preserves_error() {
     let (state, key, id) = user_fixture();
     let response = (

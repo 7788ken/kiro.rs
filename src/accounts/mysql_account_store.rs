@@ -437,7 +437,7 @@ impl AccountStore {
         } else {
             Some(actor.id)
         };
-        let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model, t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at, t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro, COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms, t.credential_id FROM credit_transactions t JOIN users u ON u.id = t.user_id LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge') WHERE t.kind IN ('reserve', 'charge', 'error') ";
+        let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model, t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at, t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro, COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms, t.credential_id, t.cache_creation_input_tokens, t.cache_read_input_tokens FROM credit_transactions t JOIN users u ON u.id = t.user_id LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge') WHERE t.kind IN ('reserve', 'charge', 'error') ";
         let rows: Vec<mysql::Row> = if let Some(id) = user_id {
             self.db.map(
                 &format!("{sql} AND t.user_id = ? ORDER BY t.created_at DESC, t.id DESC LIMIT ?"),
@@ -602,13 +602,15 @@ impl AccountStore {
             let (charge_note, adjustment_kind, adjustment_note) = settlement_notes(success, credential_credits, reported, actual, movement, ratio);
             let reserved_balance_micro: Option<i64> = tx.exec_first("SELECT reserved_balance_micro FROM credit_transactions WHERE id = ?", (&reservation.id,)).map_err(mysql_error)?;
             let balance_before_micro = reserved_balance_micro.map(|b| b + reservation.amount_micro);
-            tx.exec_drop("UPDATE credit_transactions SET kind = 'charge', amount_micro = ?, balance_after_micro = ?, input_tokens = ?, output_tokens = ?, status = 'settled', completed_at = ?, request_id = ?, path = COALESCE(?, path), model = COALESCE(?, model), stream = COALESCE(?, stream), balance_before_micro = COALESCE(?, balance_before_micro), reserved_balance_micro = COALESCE(?, reserved_balance_micro), http_status = ?, error_message = ?, duration_ms = ?, first_token_ms = ?, note = ?, credential_id = ? WHERE id = ?", vec![
+            tx.exec_drop("UPDATE credit_transactions SET kind = 'charge', amount_micro = ?, balance_after_micro = ?, input_tokens = ?, output_tokens = ?, status = 'settled', completed_at = ?, request_id = ?, path = COALESCE(?, path), model = COALESCE(?, model), stream = COALESCE(?, stream), balance_before_micro = COALESCE(?, balance_before_micro), reserved_balance_micro = COALESCE(?, reserved_balance_micro), http_status = ?, error_message = ?, duration_ms = ?, first_token_ms = ?, note = ?, credential_id = ?, cache_creation_input_tokens = ?, cache_read_input_tokens = ? WHERE id = ?", vec![
                 mysql::Value::from(-actual), mysql::Value::from(balance), mysql::Value::from(input_tokens), mysql::Value::from(output_tokens),
                 mysql::Value::from(now()), mysql::Value::from(reservation.id.clone()),
                 mysql::Value::from(log.map(|l| l.path.as_str())), mysql::Value::from(log.map(|l| l.model.as_str())),
                 mysql::Value::from(log.map(|l| l.stream as i64)), mysql::Value::from(balance_before_micro), mysql::Value::from(reserved_balance_micro),
                 mysql::Value::from(log.map(|l| l.http_status)), mysql::Value::from(log.and_then(|l| l.error_message.as_deref())),
-                mysql::Value::from(log.map(|l| l.duration_ms)), mysql::Value::from(log.and_then(|l| l.first_token_ms)), mysql::Value::from(charge_note), mysql::Value::from(credential_id), mysql::Value::from(reservation.id.clone()),
+                mysql::Value::from(log.map(|l| l.duration_ms)), mysql::Value::from(log.and_then(|l| l.first_token_ms)), mysql::Value::from(charge_note), mysql::Value::from(credential_id),
+                mysql::Value::from(log.map_or(0, |l| l.cache_creation_input_tokens)), mysql::Value::from(log.map_or(0, |l| l.cache_read_input_tokens)),
+                mysql::Value::from(reservation.id.clone()),
             ]).map_err(mysql_error)?;
             tx.exec_drop("INSERT INTO credit_transactions (id, user_id, actor_id, kind, amount_micro, balance_after_micro, status, note, created_at, completed_at, request_id) VALUES (?, ?, NULL, ?, ?, ?, 'settled', ?, ?, ?, ?)", (Uuid::new_v4().to_string(), reservation.user_id, adjustment_kind, movement, balance, Some(adjustment_note), now(), now(), &reservation.id)).map_err(mysql_error)?;
             Ok(())
@@ -827,6 +829,14 @@ fn transaction_row(row: mysql::Row) -> TransactionView {
         duration_ms: row.get::<Option<i64>, _>(22).unwrap_or_default(),
         first_token_ms: row.get::<Option<i64>, _>(23).unwrap_or_default(),
         credential_id: row.get::<Option<u64>, _>(24).unwrap_or_default(),
+        cache_creation_input_tokens: row
+            .get::<Option<i64>, _>(25)
+            .unwrap_or_default()
+            .unwrap_or_default(),
+        cache_read_input_tokens: row
+            .get::<Option<i64>, _>(26)
+            .unwrap_or_default()
+            .unwrap_or_default(),
     }
 }
 

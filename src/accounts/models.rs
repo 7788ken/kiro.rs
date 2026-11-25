@@ -146,6 +146,10 @@ pub struct TransactionView {
     pub first_token_ms: Option<i64>,
     /// 本次请求使用的上游凭证 ID（旧记录为空）
     pub credential_id: Option<u64>,
+    /// 模拟的 prompt cache 写入 token（已包含在 input_tokens 内，旧记录为 0）
+    pub cache_creation_input_tokens: i64,
+    /// 模拟的 prompt cache 读取 token（已包含在 input_tokens 内，旧记录为 0）
+    pub cache_read_input_tokens: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +172,8 @@ pub struct RequestLog {
     pub error_message: Option<String>,
     pub duration_ms: i64,
     pub first_token_ms: Option<i64>,
+    pub cache_creation_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
 }
 
 #[derive(Debug, Deserialize)]

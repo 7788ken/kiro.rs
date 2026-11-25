@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
+use super::prompt_cache::{self, CacheSplit};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -398,10 +399,13 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 模拟 prompt cache 用量（只用于 usage 展示，不影响扣费）
+    let cache_split = prompt_cache::simulate(&payload);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -419,6 +423,7 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             thinking_enabled,
             tool_name_map,
             usage,
@@ -435,6 +440,7 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             extract_thinking,
             tool_name_map,
             usage,
@@ -449,6 +455,7 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_split: CacheSplit,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
@@ -466,6 +473,7 @@ async fn handle_stream_request(
     let mut ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_credential_usage(usage);
+    ctx.set_cache_split(cache_split);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -591,6 +599,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_split: CacheSplit,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
@@ -776,10 +785,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": cache_split.apply(final_input_tokens).to_usage_json(output_tokens)
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -949,10 +955,13 @@ pub async fn post_messages_cc(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 模拟 prompt cache 用量（只用于 usage 展示，不影响扣费）
+    let cache_split = prompt_cache::simulate(&payload);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -970,6 +979,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             thinking_enabled,
             tool_name_map,
             usage,
@@ -986,6 +996,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             extract_thinking,
             tool_name_map,
             usage,
@@ -1003,6 +1014,7 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
+    cache_split: CacheSplit,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
@@ -1024,6 +1036,7 @@ async fn handle_stream_request_buffered(
         tool_name_map,
     );
     ctx.set_credential_usage(usage);
+    ctx.set_cache_split(cache_split);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

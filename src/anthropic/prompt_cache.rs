@@ -1,0 +1,471 @@
+//! Prompt cache 用量模拟
+//!
+//! 上游（Kiro）不返回 prompt cache 数据。这里按 Anthropic 官方规则在本地模拟
+//! `cache_creation_input_tokens` / `cache_read_input_tokens`，只用于展示和记录，不影响扣费。
+//!
+//! 规则：
+//! - 断点按 `tools` → `system` → `messages`（逐 content block）顺序扫描，带 `cache_control` 的位置记为断点，只取最后 4 个；
+//! - 断点键 = 该断点及之前所有段落内容的稳定哈希（哈希前去掉 `cache_control` 本身，断点移动不影响前缀）；
+//! - 缓存表 TTL 5 分钟，从最后一个断点往前找第一个未过期的命中：命中前缀记为读取，
+//!   命中位置到最后断点之间记为写入，其余记为普通输入。
+
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+
+use super::types::MessagesRequest;
+use crate::token;
+
+/// 缓存条目有效期（与官方默认 5 分钟一致）
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 每个请求最多生效的断点数
+const MAX_BREAKPOINTS: usize = 4;
+/// 缓存表超过此条数时，插入前先清理过期项
+const MAX_ENTRIES_BEFORE_PRUNE: usize = 10_000;
+
+/// 本地口径的缓存拆分结果（token 数按 `token::count_tokens` 估算）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheSplit {
+    total_local: i64,
+    read_local: i64,
+    creation_local: i64,
+}
+
+/// 返回给请求方的 usage token 拆分
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageTokens {
+    pub input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+}
+
+impl CacheSplit {
+    /// 无断点：全部计为普通输入
+    pub fn none(total_local: i64) -> Self {
+        Self {
+            total_local: total_local.max(0),
+            read_local: 0,
+            creation_local: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(total_local: i64, read_local: i64, creation_local: i64) -> Self {
+        Self {
+            total_local,
+            read_local,
+            creation_local,
+        }
+    }
+
+    /// 把本地口径按比例缩放到真实总量 `actual_total`。
+    ///
+    /// 三者之和 == `actual_total.max(1)`，且 `input_tokens >= 1`
+    /// （不足时先从 cache_read、再从 cache_creation 里让出来）。
+    pub fn apply(&self, actual_total: i32) -> UsageTokens {
+        let total = i64::from(actual_total.max(1));
+        let (mut read, mut creation) = if self.total_local > 0 {
+            (
+                self.read_local.clamp(0, self.total_local) * total / self.total_local,
+                self.creation_local.clamp(0, self.total_local) * total / self.total_local,
+            )
+        } else {
+            (0, 0)
+        };
+        if read + creation > total {
+            // 防御：本地口径异常时把超出部分从写入里扣掉
+            creation = (total - read).max(0);
+            read = read.min(total);
+        }
+        if total - read - creation < 1 {
+            if read > 0 {
+                read -= 1;
+            } else if creation > 0 {
+                creation -= 1;
+            }
+        }
+        let input = total - read - creation;
+        UsageTokens {
+            input_tokens: input as i32,
+            cache_creation_input_tokens: creation as i32,
+            cache_read_input_tokens: read as i32,
+        }
+    }
+}
+
+impl UsageTokens {
+    /// 生成 Anthropic 格式的 usage 对象
+    pub fn to_usage_json(&self, output_tokens: i32) -> Value {
+        json!({
+            "input_tokens": self.input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "output_tokens": output_tokens
+        })
+    }
+}
+
+/// 模拟本次请求的缓存命中情况（全局缓存表，有副作用：写入/刷新断点）
+pub fn simulate(payload: &MessagesRequest) -> CacheSplit {
+    static CACHE: LazyLock<PromptCache> = LazyLock::new(PromptCache::new);
+    CACHE.simulate_at(payload, Instant::now())
+}
+
+/// 一个断点：前缀哈希 + 前缀本地 token 数
+#[derive(Debug, Clone, Copy)]
+struct Breakpoint {
+    key: u64,
+    prefix_tokens: i64,
+}
+
+struct PromptCache {
+    entries: Mutex<HashMap<u64, Instant>>,
+}
+
+impl PromptCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn simulate_at(&self, payload: &MessagesRequest, now: Instant) -> CacheSplit {
+        let (mut breakpoints, total_local) = scan_breakpoints(payload);
+        if breakpoints.is_empty() {
+            return CacheSplit::none(total_local);
+        }
+        if breakpoints.len() > MAX_BREAKPOINTS {
+            breakpoints.drain(..breakpoints.len() - MAX_BREAKPOINTS);
+        }
+        let last_prefix = breakpoints.last().map(|b| b.prefix_tokens).unwrap_or(0);
+
+        let mut entries = self.entries.lock();
+        let read_local = breakpoints
+            .iter()
+            .rev()
+            .find(|b| {
+                entries
+                    .get(&b.key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < CACHE_TTL)
+            })
+            .map(|b| b.prefix_tokens)
+            .unwrap_or(0);
+
+        if entries.len() > MAX_ENTRIES_BEFORE_PRUNE {
+            entries.retain(|_, at| now.saturating_duration_since(*at) < CACHE_TTL);
+        }
+        for breakpoint in &breakpoints {
+            entries.insert(breakpoint.key, now);
+        }
+
+        CacheSplit {
+            total_local,
+            read_local,
+            creation_local: (last_prefix - read_local).max(0),
+        }
+    }
+}
+
+/// 按官方顺序扫描断点，返回（全部断点，本地口径总 token 数）
+fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Breakpoint>, i64) {
+    let mut hasher = DefaultHasher::new();
+    let mut tokens: i64 = 0;
+    let mut breakpoints = Vec::new();
+    let mut push_breakpoint = |hasher: &DefaultHasher, tokens: i64| {
+        breakpoints.push(Breakpoint {
+            key: hasher.clone().finish(),
+            prefix_tokens: tokens,
+        });
+    };
+
+    if let Some(tools) = &payload.tools {
+        for tool in tools {
+            "tool".hash(&mut hasher);
+            let value = serde_json::to_value(tool).unwrap_or(Value::Null);
+            stable_json(value).hash(&mut hasher);
+            tokens += count(&tool.name) + count(&tool.description);
+            tokens += count(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
+            if has_cache_control(tool.cache_control.as_ref()) {
+                push_breakpoint(&hasher, tokens);
+            }
+        }
+    }
+
+    if let Some(system) = &payload.system {
+        for block in system {
+            "system".hash(&mut hasher);
+            let value = serde_json::to_value(block).unwrap_or(Value::Null);
+            stable_json(value).hash(&mut hasher);
+            tokens += count(&block.text);
+            if has_cache_control(block.cache_control.as_ref()) {
+                push_breakpoint(&hasher, tokens);
+            }
+        }
+    }
+
+    for message in &payload.messages {
+        match &message.content {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    "message".hash(&mut hasher);
+                    message.role.hash(&mut hasher);
+                    stable_json(block.clone()).hash(&mut hasher);
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        tokens += count(text);
+                    }
+                    if has_cache_control(block.get("cache_control")) {
+                        push_breakpoint(&hasher, tokens);
+                    }
+                }
+            }
+            other => {
+                "message".hash(&mut hasher);
+                message.role.hash(&mut hasher);
+                stable_json(other.clone()).hash(&mut hasher);
+                if let Value::String(text) = other {
+                    tokens += count(text);
+                }
+            }
+        }
+    }
+
+    (breakpoints, tokens)
+}
+
+fn count(text: &str) -> i64 {
+    token::count_tokens(text) as i64
+}
+
+fn has_cache_control(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| !v.is_null())
+}
+
+/// 去掉顶层 `cache_control` 后序列化（serde_json 未开 preserve_order，对象键有序，输出稳定）
+fn stable_json(mut value: Value) -> String {
+    if let Value::Object(map) = &mut value {
+        map.remove("cache_control");
+    }
+    value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(value: Value) -> MessagesRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn long_text(seed: &str) -> String {
+        format!("{seed} ").repeat(200)
+    }
+
+    fn base_request(with_extra_message: bool) -> MessagesRequest {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": long_text("first question"),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        })];
+        if with_extra_message {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": long_text("an answer")}]
+            }));
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": long_text("follow up"),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }));
+        }
+        request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "tools": [{
+                "name": "read_file",
+                "description": long_text("reads a file"),
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "system": [{
+                "type": "text",
+                "text": long_text("you are helpful"),
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": messages
+        }))
+    }
+
+    fn local_total(payload: &MessagesRequest) -> i64 {
+        token::count_all_tokens_local(
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i64
+    }
+
+    #[test]
+    fn cache_control_survives_deserialization() {
+        let payload = base_request(false);
+        assert!(payload.tools.as_ref().unwrap()[0].cache_control.is_some());
+        assert!(payload.system.as_ref().unwrap()[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn no_breakpoint_is_all_input() {
+        let cache = PromptCache::new();
+        let payload = request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "system": "plain system prompt",
+            "messages": [{"role": "user", "content": "hello there"}]
+        }));
+        let split = cache.simulate_at(&payload, Instant::now());
+        assert_eq!(split, CacheSplit::none(local_total(&payload)));
+        assert_eq!(split.read_local, 0);
+        assert_eq!(split.creation_local, 0);
+        assert!(cache.entries.lock().is_empty());
+        let usage = split.apply(500);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn first_request_is_all_creation_then_repeat_is_all_read() {
+        let cache = PromptCache::new();
+        let payload = base_request(false);
+        let total = local_total(&payload);
+        let start = Instant::now();
+
+        let first = cache.simulate_at(&payload, start);
+        assert_eq!(first.total_local, total);
+        assert_eq!(first.read_local, 0);
+        assert_eq!(first.creation_local, total);
+
+        let second = cache.simulate_at(&payload, start + Duration::from_secs(60));
+        assert_eq!(second.read_local, total);
+        assert_eq!(second.creation_local, 0);
+    }
+
+    #[test]
+    fn longer_prefix_reads_old_part_and_creates_new_part() {
+        let cache = PromptCache::new();
+        let short = base_request(false);
+        let long = base_request(true);
+        let short_total = local_total(&short);
+        let long_total = local_total(&long);
+        assert!(long_total > short_total);
+        let start = Instant::now();
+
+        cache.simulate_at(&short, start);
+        let split = cache.simulate_at(&long, start + Duration::from_secs(10));
+        assert_eq!(split.read_local, short_total);
+        assert_eq!(split.creation_local, long_total - short_total);
+        assert_eq!(split.total_local, long_total);
+    }
+
+    #[test]
+    fn expired_entry_is_created_again() {
+        let cache = PromptCache::new();
+        let payload = base_request(false);
+        let total = local_total(&payload);
+        let start = Instant::now();
+
+        cache.simulate_at(&payload, start);
+        let expired = cache.simulate_at(&payload, start + CACHE_TTL + Duration::from_secs(1));
+        assert_eq!(expired.read_local, 0);
+        assert_eq!(expired.creation_local, total);
+    }
+
+    #[test]
+    fn hit_refreshes_ttl() {
+        let cache = PromptCache::new();
+        let payload = base_request(false);
+        let start = Instant::now();
+
+        cache.simulate_at(&payload, start);
+        cache.simulate_at(&payload, start + Duration::from_secs(240));
+        let split = cache.simulate_at(&payload, start + Duration::from_secs(480));
+        assert_eq!(split.read_local, local_total(&payload));
+    }
+
+    #[test]
+    fn only_last_four_breakpoints_count() {
+        let cache = PromptCache::new();
+        let block = |text: &str| json!({"type": "text", "text": long_text(text), "cache_control": {"type": "ephemeral"}});
+        let payload = request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [block("a"), block("b"), block("c"), block("d"), block("e")]}]
+        }));
+        cache.simulate_at(&payload, Instant::now());
+        assert_eq!(cache.entries.lock().len(), MAX_BREAKPOINTS);
+    }
+
+    #[test]
+    fn apply_sums_to_actual_total_with_input_at_least_one() {
+        let cases = [
+            CacheSplit { total_local: 1000, read_local: 1000, creation_local: 0 },
+            CacheSplit { total_local: 1000, read_local: 0, creation_local: 1000 },
+            CacheSplit { total_local: 1000, read_local: 600, creation_local: 300 },
+            CacheSplit { total_local: 1000, read_local: 0, creation_local: 0 },
+            CacheSplit { total_local: 0, read_local: 0, creation_local: 0 },
+        ];
+        for split in cases {
+            for actual in [-5, 0, 1, 2, 3, 7, 999, 1000, 1001, 50_000] {
+                let usage = split.apply(actual);
+                let sum = usage.input_tokens
+                    + usage.cache_creation_input_tokens
+                    + usage.cache_read_input_tokens;
+                assert_eq!(sum, actual.max(1), "{split:?} actual={actual}");
+                assert!(usage.input_tokens >= 1, "{split:?} actual={actual}");
+                assert!(usage.cache_creation_input_tokens >= 0);
+                assert!(usage.cache_read_input_tokens >= 0);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_scales_proportionally() {
+        let split = CacheSplit { total_local: 1000, read_local: 600, creation_local: 300 };
+        let larger = split.apply(2000);
+        assert_eq!(larger.cache_read_input_tokens, 1200);
+        assert_eq!(larger.cache_creation_input_tokens, 600);
+        assert_eq!(larger.input_tokens, 200);
+        let smaller = split.apply(100);
+        assert_eq!(smaller.cache_read_input_tokens, 60);
+        assert_eq!(smaller.cache_creation_input_tokens, 30);
+        assert_eq!(smaller.input_tokens, 10);
+        // 全部命中时给 input 让出 1
+        let all_read = CacheSplit { total_local: 1000, read_local: 1000, creation_local: 0 }.apply(2);
+        assert_eq!((all_read.input_tokens, all_read.cache_read_input_tokens), (1, 1));
+    }
+
+    #[test]
+    fn usage_json_has_all_fields() {
+        let usage = UsageTokens {
+            input_tokens: 3,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 7,
+        };
+        assert_eq!(
+            usage.to_usage_json(11),
+            json!({
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 11
+            })
+        );
+    }
+}

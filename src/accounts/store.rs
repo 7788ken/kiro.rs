@@ -98,7 +98,9 @@ impl AccountStore {
                 duration_ms INTEGER,
                 first_token_ms INTEGER,
                 consumption_ratio REAL NOT NULL DEFAULT 1.0,
-                credential_id INTEGER
+                credential_id INTEGER,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_transactions_user ON credit_transactions(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_transactions_pending ON credit_transactions(status) WHERE status = 'pending';
@@ -129,6 +131,8 @@ impl AccountStore {
             ("duration_ms", "INTEGER"),
             ("first_token_ms", "INTEGER"),
             ("credential_id", "INTEGER"),
+            ("cache_creation_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_read_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             ensure_column(&connection, "credit_transactions", column, definition)?;
         }
@@ -618,7 +622,7 @@ impl AccountStore {
                    t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at,
                    t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro,
                    COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms,
-                   t.credential_id
+                   t.credential_id, t.cache_creation_input_tokens, t.cache_read_input_tokens
                    FROM credit_transactions t JOIN users u ON u.id = t.user_id
                    LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge')
                    WHERE t.kind IN ('reserve', 'charge', 'error') ";
@@ -843,8 +847,8 @@ impl AccountStore {
         let balance_before_micro = reserved_balance_micro
             .map(|balance_after_reservation| balance_after_reservation + reservation.amount_micro);
         transaction.execute(
-            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15, note = ?16, credential_id = ?17 WHERE id = ?18",
-            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), charge_note, credential_id.map(|id| id as i64), reservation.id],
+            "UPDATE credit_transactions SET kind = 'charge', amount_micro = ?1, balance_after_micro = ?2, input_tokens = ?3, output_tokens = ?4, status = 'settled', completed_at = ?5, request_id = ?6, path = COALESCE(?7, path), model = COALESCE(?8, model), stream = COALESCE(?9, stream), balance_before_micro = COALESCE(?10, balance_before_micro), reserved_balance_micro = COALESCE(?11, reserved_balance_micro), http_status = ?12, error_message = ?13, duration_ms = ?14, first_token_ms = ?15, note = ?16, credential_id = ?17, cache_creation_input_tokens = ?19, cache_read_input_tokens = ?20 WHERE id = ?18",
+            params![-actual, balance, input_tokens, output_tokens, now(), reservation.id, log.map(|log| log.path.as_str()), log.map(|log| log.model.as_str()), log.map(|log| log.stream as i64), balance_before_micro, reserved_balance_micro, log.map(|log| log.http_status), log.and_then(|log| log.error_message.as_deref()), log.map(|log| log.duration_ms), log.and_then(|log| log.first_token_ms), charge_note, credential_id.map(|id| id as i64), reservation.id, log.map_or(0, |log| log.cache_creation_input_tokens), log.map_or(0, |log| log.cache_read_input_tokens)],
         )?;
         insert_transaction(
             &transaction,
@@ -1101,6 +1105,8 @@ fn transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransactionView>
         duration_ms: row.get(22)?,
         first_token_ms: row.get(23)?,
         credential_id: row.get::<_, Option<i64>>(24)?.map(|id| id as u64),
+        cache_creation_input_tokens: row.get::<_, Option<i64>>(25)?.unwrap_or(0),
+        cache_read_input_tokens: row.get::<_, Option<i64>>(26)?.unwrap_or(0),
     })
 }
 
@@ -1353,6 +1359,43 @@ mod tests {
         store.refund(&reservation, None);
         let released = &store.list_transactions(&user, None, 10).unwrap()[0];
         assert_eq!(released.credential_id, None);
+    }
+
+    #[test]
+    fn settlement_records_cache_tokens() {
+        let store = store();
+        let manager = manager(&store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 1.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        let log = RequestLog {
+            path: "/v1/messages".to_string(),
+            model: "sonnet".to_string(),
+            stream: true,
+            http_status: 200,
+            error_message: None,
+            duration_ms: 10,
+            first_token_ms: Some(5),
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 600,
+        };
+        store
+            .settle(&reservation, true, 1000, 20, Some(0.25), Some(7), Some(&log))
+            .unwrap();
+        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(charged.input_tokens, 1000);
+        assert_eq!(charged.cache_creation_input_tokens, 300);
+        assert_eq!(charged.cache_read_input_tokens, 600);
+        // 缓存值只记录，不影响结算金额
+        assert_eq!(charged.amount_micro, -250_000);
+
+        let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
+        store.refund(&reservation, None);
+        let released = &store.list_transactions(&user, None, 10).unwrap()[0];
+        assert_eq!(released.cache_creation_input_tokens, 0);
+        assert_eq!(released.cache_read_input_tokens, 0);
     }
 
     #[test]
