@@ -362,14 +362,21 @@ class Deploy:
             env["KIRO_CANDIDATE_PORT"] = str(port)
             run(["/bin/sh", "-c", self.verify_command], capture=False, env=env)
         if self.mysql_container and self.mysql_database:
+            # 在途请求的预授权由旧实例优雅排空后正常结算，不构成切流风险；
+            # 只有超过阈值仍未结算的陈旧预授权才说明账务链路有问题，需要人工处理
+            stale_seconds = int(self.env.get("KIRO_STALE_PENDING_SECONDS", "600"))
             result = run([
                 "docker", "exec", self.mysql_container,
                 "sh", "-c",
                 'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"; mysql -uroot -NBe "SELECT COUNT(*) FROM '
-                + self.mysql_database + '.credit_transactions WHERE status IN (\\"pending\\", \\"processing\\");"',
+                + self.mysql_database + '.credit_transactions WHERE status IN (\\"pending\\", \\"processing\\")'
+                + ' AND STR_TO_DATE(LEFT(created_at, 19), \\"%Y-%m-%dT%H:%i:%s\\") < UTC_TIMESTAMP() - INTERVAL '
+                + str(stale_seconds) + ' SECOND;"',
             ])
             if result.stdout.strip() != "0":
-                raise RuntimeError("存在未完成的账务预授权，暂停切换")
+                raise RuntimeError(
+                    f"存在超过 {stale_seconds} 秒未结算的账务预授权（{result.stdout.strip()} 条），暂停切换"
+                )
 
     def build_image(self):
         if not self.build:

@@ -267,7 +267,7 @@ journalctl -u caddy --since '15 minutes ago' --no-pager
 生产升级使用 `deploy/blue_green.py`，**不得再用单容器 `docker compose up -d` 直接替换活跃服务**。蓝绿流程会：
 
 1. 保留旧实例与流量，构建并启动另一颜色的候选实例。
-2. 检查 `/health/live`、`/health/ready`、管理页、MySQL 预授权状态，并用专用测试 Key 执行最小真实流式请求。
+2. 检查 `/health/live`、`/health/ready`、管理页，确认 MySQL 没有超过 `KIRO_STALE_PENDING_SECONDS`（默认 600 秒）仍未结算的陈旧预授权（在途请求不算），并用专用测试 Key 执行最小真实流式请求。
 3. 原子改写 upstream 片段文件 `/etc/caddy/kiro-rs-upstream.caddy`，先 `caddy validate` 再 reload Caddyfile；随后经公网 `/health/ready` 确认 `instance` 已变为目标颜色。
 4. 切流后再次验收。失败时立即恢复旧 upstream，旧实例未通过验收前不会停止。
 5. 旧实例收到 `SIGTERM` 后停止接收新连接，等待在途响应体（包括 SSE）完成，再退出并清理。
