@@ -61,6 +61,8 @@ KAM 平铺和嵌套格式导入会保留企业 IdC 的 `profileArn`、Auth Regio
 
 核心配置页的「品牌」卡片可设置站点名称（最多 60 字）和 Logo（SVG、PNG、JPEG、ICO 或 WebP，data URL 整串不超过 200 KB）。两项写入 `config.json` 的 `siteName` 与 `logoDataUrl`，显示在后台侧栏、页头、登录页和浏览器标题；留空站点名称使用默认的 `Kiro Console`。公开接口 `GET /api/branding` 不鉴权，仅返回这两个字段，供登录页在登录前读取。
 
+「Kiro 上游与客户端」卡片顶部显示客户端版本检测：把配置的 `kiroVersion` 与官方最新稳定版和最低支持版本比对，状态分为正常、落后最新版、不受支持和未知。最新稳定版取自 Kiro 官方桌面端更新元数据（`prod.download.desktop.kiro.dev`，超时 5 秒，启动后立即检测一次，之后每 24 小时一次，失败时保留上次结果）；最低支持版本来自代码内经人工审核的静态清单，需随官方公告手动更新。上游以 400 返回 `This version of Kiro is no longer supported` 时立即标记为不受支持，并在修改版本并检测通过后才清除。「立即检测」60 秒内只检测一次；「填入官方最低支持版本」只改输入框，仍需点保存。结果只缓存在内存，不写配置。
+
 ### 账户 API
 
 - `GET /api/account/me`：个人账户、余额与用量概览。
@@ -74,6 +76,7 @@ KAM 平铺和嵌套格式导入会保留企业 IdC 的 `profileArn`、Auth Regio
 - `POST /api/admin/users/:id/key`：重置用户 API Key。
 - `GET|PUT /api/admin/billing`：查询或设置计费单价，仅超管可修改。
 - `GET|PUT /api/admin/config/core`：读取或保存核心配置，仅超管可用；保存后热重载，使用 `revision` 防止并发覆盖。
+- `GET /api/admin/config/version-check`：Kiro 客户端版本检测的缓存结果；`POST /api/admin/config/version-check/refresh` 手动检测，60 秒内重复调用返回缓存并标记 `throttled`。管理员可用，普通用户 403。
 - `GET /api/admin/monitoring/live`：实时 RPM、进行中请求、最近完成成功率与请求记录，仅管理员可用。
 - `GET /api/admin/monitoring/usage?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&groupBy=day|user|model|status&userId=&limit=`：多维用量统计；日期为北京时间自然日，`endDate` 包含当天，明细最多 200 个分组，权限范围与流水一致。
 

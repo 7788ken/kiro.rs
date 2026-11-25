@@ -17,6 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::version_check::VersionCheckService;
 use crate::model::config::TlsBackend;
 use crate::proxy_pool::ProxyPool;
 use parking_lot::Mutex;
@@ -45,6 +46,8 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// Kiro 客户端版本检测服务（上游以 400 拒绝版本时联动标记）
+    version_check: Option<Arc<VersionCheckService>>,
 }
 
 impl KiroProvider {
@@ -82,6 +85,24 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            version_check: None,
+        }
+    }
+
+    /// 注入版本检测服务，上游返回「版本不再受支持」时同步标记
+    pub fn with_version_check(mut self, service: Option<Arc<VersionCheckService>>) -> Self {
+        self.version_check = service;
+        self
+    }
+
+    pub fn version_check(&self) -> Option<Arc<VersionCheckService>> {
+        self.version_check.clone()
+    }
+
+    /// 400 响应联动：body 表明当前 Kiro 版本不再受支持时，标记版本检测状态
+    fn note_bad_request(&self, body: &str) {
+        if let Some(service) = &self.version_check {
+            service.note_upstream_rejection(body);
         }
     }
 
@@ -247,6 +268,7 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                self.note_bad_request(&body);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -454,6 +476,7 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                self.note_bad_request(&body);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -607,5 +630,40 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kiro::endpoint::IdeEndpoint;
+    use crate::kiro::version_check::VersionStatus;
+    use crate::model::config::Config;
+
+    #[test]
+    fn bad_request_no_longer_supported_marks_version_unsupported() {
+        let runtime = crate::runtime_config::RuntimeConfig::from_config(Config::default());
+        let token_manager = Arc::new(
+            MultiTokenManager::new(runtime.clone(), Vec::new(), None, None, false).unwrap(),
+        );
+        let version_check = Arc::new(VersionCheckService::with_metadata_url(
+            runtime,
+            "http://127.0.0.1:9/meta.json",
+        ));
+        let ide = IdeEndpoint::new();
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let provider = KiroProvider::with_proxy(token_manager, None, endpoints, "ide".into())
+            .with_version_check(Some(version_check.clone()));
+
+        provider.note_bad_request(r#"{"message":"Improperly formed request."}"#);
+        assert_eq!(version_check.state().status, VersionStatus::Ok);
+
+        provider.note_bad_request(
+            r#"{"message":"This version of Kiro is no longer supported. Please upgrade."}"#,
+        );
+        let state = version_check.state();
+        assert_eq!(state.status, VersionStatus::Unsupported);
+        assert!(state.last_error.unwrap().contains("上游拒绝"));
     }
 }

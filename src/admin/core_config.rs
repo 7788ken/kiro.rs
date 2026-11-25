@@ -299,13 +299,17 @@ impl CoreConfigService {
         }
         self.token_manager.replace(next.clone());
         if let Some(provider_lock) = self.anthropic.read().kiro_provider.as_ref() {
-            let endpoints = provider_lock.read().endpoints().clone();
+            let (endpoints, version_check) = {
+                let current = provider_lock.read();
+                (current.endpoints().clone(), current.version_check())
+            };
             let new_provider = KiroProvider::with_proxy(
                 self.token_manager.clone(),
                 crate::runtime_config::proxy_from_config(&next),
                 endpoints,
                 next.default_endpoint.clone(),
-            );
+            )
+            .with_version_check(version_check);
             *provider_lock.write() = Arc::new(new_provider);
         }
         self.anthropic

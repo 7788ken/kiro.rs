@@ -7,12 +7,13 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, add_proxy, archive_credential, check_all_proxies,
-        check_credential_egress, check_proxy, delete_proxy, force_refresh_token,
-        get_all_credentials, get_core_config, get_credential_balance, get_load_balancing_mode,
-        import_proxies, list_proxies, purge_credential, reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_credential_proxy, set_load_balancing_mode, set_proxy_enabled, unarchive_credential,
-        update_core_config, update_proxy,
+        add_credential, add_proxy, archive_credential, check_all_proxies, check_credential_egress,
+        check_proxy, delete_proxy, force_refresh_token, get_all_credentials, get_core_config,
+        get_credential_balance, get_load_balancing_mode, get_version_check, import_proxies,
+        list_proxies, purge_credential, refresh_version_check, reset_failure_count,
+        set_credential_disabled, set_credential_priority, set_credential_proxy,
+        set_load_balancing_mode, set_proxy_enabled, unarchive_credential, update_core_config,
+        update_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -40,6 +41,8 @@ use super::{
 /// - `POST /proxies/import` - 批量导入出口代理（每行一个）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /config/version-check` - Kiro 客户端版本检测结果（缓存）
+/// - `POST /config/version-check/refresh` - 手动触发版本检测（60 秒防抖）
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -48,6 +51,8 @@ use super::{
 pub fn create_admin_router(state: AdminState) -> Router {
     let core = Router::new()
         .route("/config/core", get(get_core_config).put(update_core_config))
+        .route("/config/version-check", get(get_version_check))
+        .route("/config/version-check/refresh", post(refresh_version_check))
         .route(
             "/monitoring/live",
             get(super::monitoring::get_live_requests),
@@ -140,6 +145,7 @@ mod tests {
             vec!["ide".into()],
         );
         let proxy_pool = token_manager.proxy_pool();
+        let version_check = test_version_check(token_manager.runtime_config());
         let service = AdminService::new(token_manager, ["ide".to_string()], store.clone());
         let account_state = AccountState::new(store.clone(), "test-admin-key-123456");
         let app = create_admin_router(AdminState::new(
@@ -147,6 +153,7 @@ mod tests {
             service,
             account_state.clone(),
             core_config,
+            version_check,
         ))
         .layer(middleware::from_fn_with_state(
             account_state,
@@ -158,6 +165,18 @@ mod tests {
             super_admin,
             proxy_pool,
         }
+    }
+
+    /// 指向本机不可达端口，避免测试访问外网；拉取失败仍可按静态最低版本判定
+    fn test_version_check(
+        runtime: Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> Arc<crate::kiro::version_check::VersionCheckService> {
+        Arc::new(
+            crate::kiro::version_check::VersionCheckService::with_metadata_url(
+                runtime,
+                "http://127.0.0.1:9/metadata.json",
+            ),
+        )
     }
 
     fn create_admin(
@@ -480,6 +499,7 @@ mod tests {
             service,
             AccountState::new(fixture.store.clone(), "test-admin-key-123456"),
             core_config,
+            test_version_check(token_manager.runtime_config()),
         ))
         .layer(middleware::from_fn_with_state(
             AccountState::new(fixture.store.clone(), "test-admin-key-123456"),
@@ -1243,5 +1263,84 @@ mod tests {
         let (status, body) = request(&fixture.app, "POST", "/proxies/check-all", key, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(find_proxy(&body, pool_id)["health"]["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn version_check_endpoints_return_full_state() {
+        let fixture = fixture();
+        let (_, admin_key) = create_admin(&fixture.store, &fixture.super_admin, "version-admin");
+        let fields = [
+            "configuredVersion",
+            "latestVersion",
+            "latestPubDate",
+            "minVersion",
+            "minSourceUrl",
+            "minEffectiveDate",
+            "checkedAt",
+            "lastError",
+            "status",
+        ];
+        let (status, body) = request(
+            &fixture.app,
+            "GET",
+            "/config/version-check",
+            &admin_key,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for field in fields {
+            assert!(body.get(field).is_some(), "缺少字段 {field}: {body}");
+        }
+        assert_eq!(body["minVersion"], "0.11.133");
+        assert_eq!(body["configuredVersion"], Config::default().kiro_version);
+        assert_eq!(body["status"], "ok");
+
+        let (status, body) = request(
+            &fixture.app,
+            "POST",
+            "/config/version-check/refresh",
+            &admin_key,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for field in fields {
+            assert!(body.get(field).is_some(), "缺少字段 {field}: {body}");
+        }
+        assert_eq!(body["throttled"], false);
+        assert!(body["checkedAt"].is_string(), "{body}");
+        assert!(body["lastError"].is_string(), "拉取失败应记录错误: {body}");
+
+        let (status, body) = request(
+            &fixture.app,
+            "POST",
+            "/config/version-check/refresh",
+            "test-admin-key-123456",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["throttled"], true);
+
+        let (_, user_key) = fixture
+            .store
+            .create_user(
+                &fixture.super_admin,
+                "version-member",
+                "password-123",
+                Role::User,
+                0.0,
+            )
+            .unwrap();
+        let (status, _) = request(
+            &fixture.app,
+            "GET",
+            "/config/version-check",
+            &user_key,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
