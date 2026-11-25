@@ -23,6 +23,8 @@ export interface CredentialStatusItem {
   successCount: number
   lastUsedAt: string | null
   usedCredits: number
+  recentRequests: number
+  rateLimited: boolean
   hasProxy: boolean
   proxyUrl?: string
   proxyId?: number

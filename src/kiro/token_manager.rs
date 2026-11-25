@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -421,6 +421,48 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
     used_credits: f64,
+    /// 近期被选中发出请求的时间点（仅内存，用于 balanced 均衡，不落盘）
+    recent_requests: VecDeque<Instant>,
+    /// 上游限流（429）冷却截止时间（仅内存，不落盘）
+    rate_limited_until: Option<Instant>,
+}
+
+impl CredentialEntry {
+    /// 丢弃窗口外的近期请求记录
+    fn prune_recent_requests(&mut self, now: Instant, window: StdDuration) {
+        while let Some(&front) = self.recent_requests.front() {
+            if now.saturating_duration_since(front) >= window {
+                self.recent_requests.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 窗口内的请求数（不修改队列）
+    fn recent_request_count(&self, now: Instant, window: StdDuration) -> usize {
+        self.recent_requests
+            .iter()
+            .filter(|t| now.saturating_duration_since(**t) < window)
+            .count()
+    }
+
+    /// 是否处于上游限流冷却期
+    fn is_rate_limited(&self, now: Instant) -> bool {
+        self.rate_limited_until.is_some_and(|until| until > now)
+    }
+
+    /// 能否承接该请求：未禁用，且 opus 模型需要订阅等级支持（不考虑限流冷却）
+    fn is_eligible(&self, is_opus: bool) -> bool {
+        !self.disabled && (!is_opus || self.credentials.supports_opus())
+    }
+}
+
+/// 是否为 opus 模型（opus 需要付费订阅）
+fn is_opus_model(model: Option<&str>) -> bool {
+    model
+        .map(|m| m.to_lowercase().contains("opus"))
+        .unwrap_or(false)
 }
 
 /// 禁用原因
@@ -486,6 +528,10 @@ pub struct CredentialEntrySnapshot {
     pub last_used_at: Option<String>,
     /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
     pub used_credits: f64,
+    /// 近 RECENT_WINDOW 内被选中发出的请求数
+    pub recent_requests: usize,
+    /// 当前是否处于上游限流冷却期
+    pub rate_limited: bool,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示；绑定代理池时为池条目的地址，不含密码）
@@ -568,12 +614,18 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// balanced 模式统计近期请求数的时间窗口（默认 RECENT_WINDOW，测试可调小）
+    recent_window: StdDuration,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// balanced 模式统计近期请求数的时间窗口
+const RECENT_WINDOW: StdDuration = StdDuration::from_secs(60);
+/// 凭据触发上游限流（429）后的冷却时长
+const RATE_LIMIT_COOLDOWN: StdDuration = StdDuration::from_secs(30);
 
 /// API 调用上下文
 ///
@@ -644,6 +696,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     used_credits: 0.0,
+                    recent_requests: VecDeque::new(),
+                    rate_limited_until: None,
                 }
             })
             .collect();
@@ -700,6 +754,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            recent_window: RECENT_WINDOW,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -732,6 +787,14 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
         )
+    }
+
+    #[cfg(test)]
+    fn set_success_count_for_test(&self, id: u64, success_count: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.success_count = success_count;
+        }
     }
 
     /// 获取配置的引用
@@ -776,32 +839,41 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：选择近 `recent_window` 内请求数最少的可用凭据
+    ///
+    /// 处于上游限流冷却期的凭据会被跳过；若因此没有可选凭据，则忽略冷却退回原规则
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let window = self.recent_window;
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+        let is_opus = is_opus_model(model);
+        let eligible = |e: &CredentialEntry| e.is_eligible(is_opus);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        // 清理窗口外的近期请求记录
+        for e in entries.iter_mut().filter(|e| eligible(e)) {
+            e.prune_recent_requests(now, window);
+        }
+
+        // 过滤可用凭据（跳过限流冷却期内的凭据）
+        let mut available: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| eligible(e) && !e.is_rate_limited(now))
             .collect();
+
+        if available.is_empty() {
+            // 宁可再打一次被限流的凭据，也不要返回"无可用凭据"
+            available = entries.iter().filter(|e| eligible(e)).collect();
+            if !available.is_empty() {
+                tracing::debug!(
+                    "可用凭据均处于限流冷却期（{} 个），忽略冷却按原规则选择",
+                    available.len()
+                );
+            }
+        }
 
         if available.is_empty() {
             return None;
@@ -812,11 +884,12 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                // 选择近期请求数最少的凭据，平局时按优先级（数字越小优先级越高），
+                // 仍并列则随机选一个，避免并发请求扎堆到同一凭据
+                let key = |e: &CredentialEntry| (e.recent_requests.len(), e.credentials.priority);
+                let min_key = available.iter().map(|e| key(e)).min()?;
+                let ties: Vec<_> = available.iter().filter(|e| key(e) == min_key).collect();
+                let entry = ties[fastrand::usize(..ties.len())];
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -856,15 +929,22 @@ impl MultiTokenManager {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
+                // priority 模式：优先使用 current_id 指向的凭据；
+                // 当前凭据处于限流冷却期时临时改选其他凭据，但不改 current_id，冷却结束后回到当前凭据
+                let mut current_rate_limited = false;
                 let current_hit = if is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
+                    let now = Instant::now();
                     entries
                         .iter()
                         .find(|e| e.id == current_id && !e.disabled)
+                        .filter(|e| {
+                            current_rate_limited = e.is_rate_limited(now);
+                            !current_rate_limited
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -896,9 +976,11 @@ impl MultiTokenManager {
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        // 更新 current_id（当前凭据仅因限流冷却被临时绕开时保持不变）
+                        if !current_rate_limited {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
@@ -914,6 +996,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    self.record_request(ctx.id);
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -931,6 +1014,17 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 记录一次即将发出的请求（用于 balanced 模式的近期请求数统计）
+    fn record_request(&self, id: u64) {
+        let now = Instant::now();
+        let window = self.recent_window;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.prune_recent_requests(now, window);
+            entry.recent_requests.push_back(now);
         }
     }
 
@@ -1355,6 +1449,29 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据触发上游限流（429）
+    ///
+    /// 设置冷却期（RATE_LIMIT_COOLDOWN），冷却期内选择凭据时跳过该凭据；
+    /// 不计入失败次数、不禁用、不落盘。
+    /// 返回是否还有其他能承接该模型请求的凭据（过滤规则与 `select_next_credential` 相同：
+    /// 未禁用、未在冷却期、opus 模型需订阅支持）
+    pub fn report_rate_limited(&self, id: u64, model: Option<&str>) -> bool {
+        let is_opus = is_opus_model(model);
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.rate_limited_until = Some(now + RATE_LIMIT_COOLDOWN);
+            tracing::warn!(
+                "凭据 #{} 触发上游限流，冷却 {} 秒",
+                id,
+                RATE_LIMIT_COOLDOWN.as_secs()
+            );
+        }
+        entries
+            .iter()
+            .any(|e| e.id != id && e.is_eligible(is_opus) && !e.is_rate_limited(now))
+    }
+
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
@@ -1558,6 +1675,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Instant::now();
 
         ManagerSnapshot {
             entries: entries
@@ -1613,6 +1731,8 @@ impl MultiTokenManager {
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     used_credits: e.used_credits,
+                    recent_requests: e.recent_request_count(now, self.recent_window),
+                    rate_limited: e.is_rate_limited(now),
                     has_proxy: e.credentials.proxy_url.is_some() || bound_proxy.is_some(),
                     proxy_url: bound_proxy
                         .as_ref()
@@ -1968,6 +2088,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 used_credits: 0.0,
+                recent_requests: VecDeque::new(),
+                rate_limited_until: None,
             });
         }
 
@@ -2868,6 +2990,140 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    fn valid_token_cred(token: &str) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some(token.to_string());
+        cred.refresh_token = Some(format!("refresh-{token}"));
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred
+    }
+
+    fn balanced_manager(count: usize) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let creds = (1..=count).map(|i| valid_token_cred(&format!("t{i}"))).collect();
+        MultiTokenManager::new_for_test(config, creds, None, None, false).unwrap()
+    }
+
+    fn recent_requests_of(manager: &MultiTokenManager, id: u64) -> usize {
+        manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap()
+            .recent_requests
+    }
+
+    fn rate_limited_of(manager: &MultiTokenManager, id: u64) -> bool {
+        manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap()
+            .rate_limited
+    }
+
+    #[tokio::test]
+    async fn test_balanced_spreads_by_recent_requests_not_success_count() {
+        let manager = balanced_manager(3);
+        // 凭据 #1、#2 是老凭据（累计成功次数很高），#3 是新加入的凭据
+        manager.set_success_count_for_test(1, 722);
+        manager.set_success_count_for_test(2, 500);
+
+        let mut hits: HashMap<u64, usize> = HashMap::new();
+        for _ in 0..10 {
+            let ctx = manager.acquire_context(None).await.unwrap();
+            *hits.entry(ctx.id).or_default() += 1;
+        }
+
+        for id in 1..=3 {
+            assert!(
+                hits.get(&id).copied().unwrap_or(0) >= 2,
+                "凭据 #{id} 命中次数过少: {hits:?}"
+            );
+        }
+        let total: usize = (1..=3).map(|id| recent_requests_of(&manager, id)).sum();
+        assert_eq!(total, 10);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_recent_requests_expire_after_window() {
+        let mut manager = balanced_manager(1);
+        manager.recent_window = StdDuration::from_millis(10);
+
+        manager.acquire_context(None).await.unwrap();
+        manager.acquire_context(None).await.unwrap();
+        assert_eq!(recent_requests_of(&manager, 1), 2);
+
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(recent_requests_of(&manager, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_credential_skipped_during_cooldown() {
+        let manager = balanced_manager(2);
+
+        // 还有 #2 可用
+        assert!(manager.report_rate_limited(1, None));
+        assert!(rate_limited_of(&manager, 1));
+        assert!(!rate_limited_of(&manager, 2));
+        // 限流不计入失败、不禁用
+        assert_eq!(manager.available_count(), 2);
+        assert_eq!(manager.snapshot().entries[0].failure_count, 0);
+
+        for _ in 0..5 {
+            let ctx = manager.acquire_context(None).await.unwrap();
+            assert_eq!(ctx.id, 2);
+        }
+
+        // 两个都在冷却：返回 false，但仍能选出凭据
+        assert!(!manager.report_rate_limited(2, None));
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert!(ctx.id == 1 || ctx.id == 2);
+    }
+
+    #[test]
+    fn test_report_rate_limited_ignores_disabled_others() {
+        let manager = balanced_manager(2);
+        manager.set_disabled(2, true).unwrap();
+        assert!(!manager.report_rate_limited(1, None));
+        assert!(manager.select_next_credential(None).is_some());
+    }
+
+    #[test]
+    fn test_report_rate_limited_opus_ignores_free_others() {
+        let cred1 = valid_token_cred("t1");
+        let mut cred2 = valid_token_cred("t2");
+        cred2.subscription_title = Some("KIRO FREE".to_string());
+        let manager =
+            MultiTokenManager::new_for_test(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap();
+
+        // #2 是 FREE 订阅，接不了 opus：#1 被限流后，opus 请求已无其他可用凭据
+        assert!(!manager.report_rate_limited(1, Some("claude-opus-4.5")));
+        // 非 opus 请求仍可换到 #2
+        assert!(manager.report_rate_limited(1, Some("claude-sonnet-4.5")));
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_rate_limited_current_falls_back_without_switching() {
+        let mut cred1 = valid_token_cred("t1");
+        cred1.priority = 0;
+        let mut cred2 = valid_token_cred("t2");
+        cred2.priority = 1;
+        let manager =
+            MultiTokenManager::new_for_test(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap();
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
+
+        assert!(manager.report_rate_limited(1, None));
+        assert_eq!(manager.acquire_context(None).await.unwrap().id, 2);
+        // 冷却只是临时绕开，current_id 仍指向优先级最高的凭据
+        assert_eq!(manager.snapshot().current_id, 1);
     }
 
     #[test]

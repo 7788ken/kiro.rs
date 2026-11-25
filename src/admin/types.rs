@@ -52,6 +52,10 @@ pub struct CredentialStatusItem {
     pub last_used_at: Option<String>,
     /// 累计消耗的上游积分（metering 事件 credits，不含用户结算倍率）
     pub used_credits: f64,
+    /// 近 1 分钟内被选中发出的请求数
+    pub recent_requests: usize,
+    /// 当前是否处于上游限流冷却期
+    pub rate_limited: bool,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示；绑定代理池时为池条目地址，不含密码）

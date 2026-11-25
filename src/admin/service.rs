@@ -112,6 +112,8 @@ impl AdminService {
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 used_credits: entry.used_credits,
+                recent_requests: entry.recent_requests,
+                rate_limited: entry.rate_limited,
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 proxy_id: entry.proxy_id,
