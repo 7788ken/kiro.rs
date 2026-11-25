@@ -233,9 +233,7 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
                     "message".hash(&mut hasher);
                     message.role.hash(&mut hasher);
                     stable_json(block.clone()).hash(&mut hasher);
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        tokens += count(text);
-                    }
+                    tokens += block_tokens(block);
                     push_boundary(&hasher, tokens, has_cache_control(block.get("cache_control")));
                 }
             }
@@ -256,6 +254,32 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
 
 fn count(text: &str) -> i64 {
     token::count_tokens(text) as i64
+}
+
+/// 图片 / 文档 block 的固定估算值（官方图片约 1600 token 上限的近似；文档无法估算，同样取此值）
+const MEDIA_BLOCK_TOKENS: i64 = 1500;
+
+/// 估算一个消息 content block 的本地 token 数（按 `type` 分支，未知类型或缺字段计 0）
+fn block_tokens(block: &Value) -> i64 {
+    let str_field = |key: &str| block.get(key).and_then(Value::as_str).map_or(0, count);
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => str_field("text"),
+        Some("thinking") => str_field("thinking"),
+        Some("redacted_thinking") => str_field("data"),
+        Some("tool_use") => {
+            let input = block
+                .get("input")
+                .map_or(0, |input| count(&input.to_string()));
+            str_field("name") + input
+        }
+        Some("tool_result") => match block.get("content") {
+            Some(Value::String(text)) => count(text),
+            Some(Value::Array(blocks)) => blocks.iter().map(block_tokens).sum(),
+            _ => 0,
+        },
+        Some("image") | Some("document") => MEDIA_BLOCK_TOKENS,
+        _ => 0,
+    }
 }
 
 fn has_cache_control(value: Option<&Value>) -> bool {
@@ -496,6 +520,97 @@ mod tests {
         let beyond = cache.simulate_at(&round2, start + Duration::from_secs(30));
         assert_eq!(beyond.read_local, system_prefix_tokens());
         assert_eq!(beyond.creation_local, beyond.total_local - system_prefix_tokens());
+    }
+
+    fn tool_use_block(id: &str) -> Value {
+        json!({
+            "type": "tool_use",
+            "id": id,
+            "name": "read_file",
+            "input": {
+                "path": format!("/workspace/src/{id}/module.rs"),
+                "note": long_text("look at the surrounding code before editing"),
+            }
+        })
+    }
+
+    fn tool_result_block(id: &str) -> Value {
+        json!({
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": format!("fn {id}() {{ let value = compute(); }}\n").repeat(50)
+        })
+    }
+
+    #[test]
+    fn tool_blocks_are_counted_and_new_turn_is_creation() {
+        let final_text = "please continue";
+        let round1 = request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [tool_result_block("toolu_a")]},
+                {"role": "assistant", "content": [tool_use_block("toolu_b")]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": final_text, "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        }));
+        assert!(tool_result_block("toolu_a")["content"].as_str().unwrap().len() >= 2000);
+        assert!(tool_use_block("toolu_b")["input"].to_string().len() >= 500);
+
+        let new_tool_use = tool_use_block("toolu_c");
+        let mut new_tool_result = tool_result_block("toolu_c");
+        new_tool_result["cache_control"] = json!({"type": "ephemeral"});
+        let round2 = request(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [tool_result_block("toolu_a")]},
+                {"role": "assistant", "content": [tool_use_block("toolu_b")]},
+                {"role": "user", "content": [{"type": "text", "text": final_text}]},
+                {"role": "assistant", "content": [new_tool_use.clone()]},
+                {"role": "user", "content": [new_tool_result.clone()]}
+            ]
+        }));
+
+        let cache = PromptCache::new();
+        let start = Instant::now();
+        let first = cache.simulate_at(&round1, start);
+        let text_only = count(final_text);
+        assert!(
+            first.total_local > text_only + 500,
+            "total_local={} text_only={text_only}",
+            first.total_local
+        );
+        assert_eq!(first.creation_local, first.total_local);
+
+        let second = cache.simulate_at(&round2, start + Duration::from_secs(30));
+        let expected_creation = block_tokens(&new_tool_use) + block_tokens(&new_tool_result);
+        assert!(expected_creation > 0);
+        assert_eq!(second.read_local, first.total_local);
+        assert_eq!(second.creation_local, expected_creation);
+        assert_eq!(second.total_local, first.total_local + expected_creation);
+    }
+
+    #[test]
+    fn block_tokens_by_type() {
+        let text = "some words to count here";
+        let n = count(text);
+        assert_eq!(block_tokens(&json!({"type": "text", "text": text})), n);
+        assert_eq!(block_tokens(&json!({"type": "thinking", "thinking": text})), n);
+        assert_eq!(block_tokens(&json!({"type": "redacted_thinking", "data": text})), n);
+        assert_eq!(
+            block_tokens(&json!({"type": "tool_result", "content": [
+                {"type": "text", "text": text},
+                {"type": "image", "source": {}}
+            ]})),
+            n + MEDIA_BLOCK_TOKENS
+        );
+        assert_eq!(block_tokens(&json!({"type": "document"})), MEDIA_BLOCK_TOKENS);
+        assert_eq!(block_tokens(&json!({"type": "tool_use"})), 0);
+        assert_eq!(block_tokens(&json!({"type": "unknown", "text": text})), 0);
+        assert_eq!(block_tokens(&json!({"text": text})), 0);
     }
 
     #[test]
