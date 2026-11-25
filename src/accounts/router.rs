@@ -12,7 +12,7 @@ use super::{
     middleware::{AccountState, account_auth_middleware, admin_auth_middleware, error_response},
     models::{
         AdjustCreditsRequest, BillingConfig, ChangePasswordRequest, CreateUserRequest,
-        CreateUserResponse, TransactionQuery, UpdateUserRequest,
+        CreateUserResponse, TransactionFacetsQuery, TransactionQuery, UpdateUserRequest,
     },
     store::AccountError,
 };
@@ -25,6 +25,7 @@ pub fn account_router(state: AccountState) -> Router {
         .route("/key", post(regenerate_own_key))
         .route("/transactions", get(get_transactions))
         .route("/transactions/adjustments", get(get_credit_changes))
+        .route("/transactions/facets", get(get_transaction_facets))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             account_auth_middleware,
@@ -131,11 +132,24 @@ async fn get_transactions(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<TransactionQuery>,
 ) -> Response {
-    respond(
-        state
-            .store
-            .list_transactions(&user, query.user_id, query.limit.unwrap_or(100)),
-    )
+    let filter = match query.filter() {
+        Ok(filter) => filter,
+        Err(message) => return error_response(AccountError::InvalidInput(message)),
+    };
+    respond(state.store.list_transactions(
+        &user,
+        query.user_id,
+        &filter,
+        query.limit.unwrap_or(100),
+    ))
+}
+
+async fn get_transaction_facets(
+    State(state): State<AccountState>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<TransactionFacetsQuery>,
+) -> Response {
+    respond(state.store.transaction_facets(&user, query.user_id))
 }
 
 async fn get_credit_changes(

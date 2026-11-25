@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use super::models::{
     AccountOverview, AuthUser, BillingConfig, CreditChangeView, MICRO_CREDITS, RequestLog,
-    Reservation, Role, TransactionView, UserView, credential_charge_micro, settlement_notes,
+    Reservation, Role, TransactionFacets, TransactionFilter, TransactionView, UserView,
+    credential_charge_micro, settlement_notes, transaction_scope,
 };
 use super::mysql_store::{MySqlStore, Params, mysql_error};
 
@@ -429,29 +430,56 @@ impl AccountStore {
         &self,
         actor: &AuthUser,
         requested_user: Option<i64>,
+        filter: &TransactionFilter,
         limit: u32,
     ) -> Result<Vec<TransactionView>, AccountError> {
         self.ensure_transaction_access(actor, requested_user)?;
-        let user_id = if actor.is_manager() {
-            requested_user
-        } else {
-            Some(actor.id)
-        };
+        let user_id = transaction_scope(actor, requested_user);
         let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model, t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at, t.request_id, t.path, t.stream, t.balance_before_micro, t.reserved_balance_micro, COALESCE(r.amount_micro, 0), t.http_status, t.error_message, t.duration_ms, t.first_token_ms, t.credential_id, t.cache_creation_input_tokens, t.cache_read_input_tokens FROM credit_transactions t JOIN users u ON u.id = t.user_id LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge') WHERE t.kind IN ('reserve', 'charge', 'error') ";
-        let rows: Vec<mysql::Row> = if let Some(id) = user_id {
-            self.db.map(
-                &format!("{sql} AND t.user_id = ? ORDER BY t.created_at DESC, t.id DESC LIMIT ?"),
-                vec![mysql::Value::from(id), mysql::Value::from(limit.min(500))],
-                |row| row,
-            )?
-        } else {
-            self.db.map(
-                &format!("{sql} ORDER BY t.created_at DESC, t.id DESC LIMIT ?"),
-                vec![mysql::Value::from(limit.min(500))],
-                |row| row,
-            )?
-        };
+        let (conditions, filter_values) = filter.sql_conditions();
+        let mut values: Vec<mysql::Value> = Vec::new();
+        let mut where_clause = conditions;
+        if let Some(id) = user_id {
+            where_clause = format!(" AND t.user_id = ?{where_clause}");
+            values.push(mysql::Value::from(id));
+        }
+        values.extend(filter_values.into_iter().map(mysql::Value::from));
+        values.push(mysql::Value::from(limit.min(500)));
+        let rows: Vec<mysql::Row> = self.db.map(
+            &format!("{sql}{where_clause} ORDER BY t.created_at DESC, t.id DESC LIMIT ?"),
+            values,
+            |row| row,
+        )?;
         Ok(rows.into_iter().map(transaction_row).collect())
+    }
+
+    /// 最近 30 天调用记录里出现过的模型和接口，供流水页筛选下拉使用；可见范围同 list_transactions。
+    pub fn transaction_facets(
+        &self,
+        actor: &AuthUser,
+        requested_user: Option<i64>,
+    ) -> Result<TransactionFacets, AccountError> {
+        self.ensure_transaction_access(actor, requested_user)?;
+        let user_id = transaction_scope(actor, requested_user);
+        let since = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let distinct = |column: &str| -> Result<Vec<String>, AccountError> {
+            let mut values = vec![mysql::Value::from(since.clone())];
+            let scope = match user_id {
+                Some(id) => {
+                    values.push(mysql::Value::from(id));
+                    " AND t.user_id = ?"
+                }
+                None => "",
+            };
+            self.db.query(
+                &format!("SELECT DISTINCT t.{column} FROM credit_transactions t WHERE t.kind IN ('reserve', 'charge', 'error') AND t.created_at >= ?{scope} AND t.{column} IS NOT NULL AND t.{column} <> '' ORDER BY t.{column}"),
+                values,
+            )
+        };
+        Ok(TransactionFacets {
+            models: distinct("model")?,
+            paths: distinct("path")?,
+        })
     }
 
     pub fn usage_stats(
@@ -644,15 +672,7 @@ impl AccountStore {
         limit: u32,
     ) -> Result<Vec<CreditChangeView>, AccountError> {
         self.ensure_transaction_access(actor, requested_user)?;
-        let user_id = if actor.is_manager() {
-            match requested_user {
-                Some(_) => requested_user,
-                None if actor.role == Role::SuperAdmin => None,
-                None => Some(actor.id),
-            }
-        } else {
-            Some(actor.id)
-        };
+        let user_id = transaction_scope(actor, requested_user);
         let sql = "SELECT kind, amount_micro, balance_after_micro, note, created_at, completed_at FROM credit_transactions WHERE request_id IS NULL AND kind IN ('initial', 'adjustment')";
         let rows: Vec<(String, i64, i64, Option<String>, String, Option<String>)> =
             if let Some(id) = user_id {

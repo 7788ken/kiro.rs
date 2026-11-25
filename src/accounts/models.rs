@@ -65,6 +65,21 @@ impl AuthUser {
     }
 }
 
+/// 调用记录和积分调整的用户范围：超管不指定用户看全部，其余管理员不指定只看自己，普通用户只看自己。
+///
+/// 指定用户时是否有权查看由各存储的 `ensure_transaction_access` 先行校验。
+pub fn transaction_scope(actor: &AuthUser, requested_user: Option<i64>) -> Option<i64> {
+    if actor.is_manager() {
+        match requested_user {
+            Some(_) => requested_user,
+            None if actor.role == Role::SuperAdmin => None,
+            None => Some(actor.id),
+        }
+    } else {
+        Some(actor.id)
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserView {
@@ -181,6 +196,141 @@ pub struct RequestLog {
 pub struct TransactionQuery {
     pub user_id: Option<i64>,
     pub limit: Option<u32>,
+    /// RFC3339 或 YYYY-MM-DD（按 UTC 日界），created_at >= start
+    pub start: Option<String>,
+    /// RFC3339（created_at <= end）或 YYYY-MM-DD（created_at < end 次日 UTC 零点）
+    pub end: Option<String>,
+    /// success | failed
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionFacetsQuery {
+    pub user_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionFacets {
+    pub models: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+/// 调用记录的筛选条件，时间边界已统一成 UTC RFC3339 字符串，可直接与 created_at 做字符串比较。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TransactionFilter {
+    pub created_from: Option<String>,
+    pub created_before: Option<String>,
+    pub created_until: Option<String>,
+    pub failed: Option<bool>,
+    pub model: Option<String>,
+    pub path: Option<String>,
+}
+
+/// 与用量统计一致：http_status >= 400 或 kind = 'error' 记为失败；http_status 为空按成功算。
+const FAILED_TRANSACTION_SQL: &str = "(COALESCE(t.http_status, 0) >= 400 OR t.kind = 'error')";
+
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn utc_midnight(date: chrono::NaiveDate) -> String {
+    date.and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .to_rfc3339()
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Utc).to_rfc3339())
+}
+
+impl TransactionQuery {
+    pub fn filter(&self) -> Result<TransactionFilter, String> {
+        let mut filter = TransactionFilter {
+            model: non_empty(&self.model),
+            path: non_empty(&self.path),
+            ..TransactionFilter::default()
+        };
+        if let Some(start) = non_empty(&self.start) {
+            filter.created_from = Some(
+                match chrono::NaiveDate::parse_from_str(&start, "%Y-%m-%d") {
+                    Ok(date) => utc_midnight(date),
+                    Err(_) => parse_rfc3339_utc(&start)
+                        .ok_or("开始时间格式必须为 RFC3339 或 YYYY-MM-DD")?,
+                },
+            );
+        }
+        if let Some(end) = non_empty(&self.end) {
+            match chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d") {
+                Ok(date) => {
+                    let next = date
+                        .succ_opt()
+                        .ok_or("结束日期超出范围")?;
+                    filter.created_before = Some(utc_midnight(next));
+                }
+                Err(_) => {
+                    filter.created_until = Some(
+                        parse_rfc3339_utc(&end)
+                            .ok_or("结束时间格式必须为 RFC3339 或 YYYY-MM-DD")?,
+                    );
+                }
+            }
+        }
+        filter.failed = match non_empty(&self.status).as_deref() {
+            None => None,
+            Some("success") => Some(false),
+            Some("failed") => Some(true),
+            Some(_) => return Err("状态只能是 success 或 failed".into()),
+        };
+        Ok(filter)
+    }
+}
+
+impl TransactionFilter {
+    /// 返回以 " AND " 开头的条件片段和按顺序对应的参数，占位符统一用 `?`。
+    pub fn sql_conditions(&self) -> (String, Vec<String>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        if let Some(value) = &self.created_from {
+            sql.push_str(" AND t.created_at >= ?");
+            params.push(value.clone());
+        }
+        if let Some(value) = &self.created_before {
+            sql.push_str(" AND t.created_at < ?");
+            params.push(value.clone());
+        }
+        if let Some(value) = &self.created_until {
+            sql.push_str(" AND t.created_at <= ?");
+            params.push(value.clone());
+        }
+        match self.failed {
+            Some(true) => sql.push_str(&format!(" AND {FAILED_TRANSACTION_SQL}")),
+            // 未结算的预扣（pending reserve）还不知道结果，不算成功
+            Some(false) => sql.push_str(&format!(
+                " AND NOT {FAILED_TRANSACTION_SQL} AND t.kind <> 'reserve'"
+            )),
+            None => {}
+        }
+        if let Some(value) = &self.model {
+            sql.push_str(" AND t.model = ?");
+            params.push(value.clone());
+        }
+        if let Some(value) = &self.path {
+            sql.push_str(" AND t.path = ?");
+            params.push(value.clone());
+        }
+        (sql, params)
+    }
 }
 
 fn default_consumption_ratio() -> f64 {
@@ -402,4 +552,50 @@ pub struct AccountOverview {
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor(id: i64, role: Role) -> AuthUser {
+        AuthUser {
+            id,
+            username: format!("user-{id}"),
+            role,
+            parent_id: None,
+            balance_micro: 0,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn transaction_scope_limits_unspecified_queries_to_self_except_super_admin() {
+        // 超管：不指定看全部，指定看指定的
+        assert_eq!(transaction_scope(&actor(1, Role::SuperAdmin), None), None);
+        assert_eq!(transaction_scope(&actor(1, Role::SuperAdmin), Some(7)), Some(7));
+        // 普通管理员：不指定只看自己，指定看指定的（权限由 ensure_transaction_access 校验）
+        assert_eq!(transaction_scope(&actor(2, Role::Admin), None), Some(2));
+        assert_eq!(transaction_scope(&actor(2, Role::Admin), Some(7)), Some(7));
+        // 普通用户：始终只看自己
+        assert_eq!(transaction_scope(&actor(3, Role::User), None), Some(3));
+        assert_eq!(transaction_scope(&actor(3, Role::User), Some(7)), Some(3));
+    }
+
+    #[test]
+    fn success_filter_excludes_unsettled_reserves() {
+        let success = TransactionFilter {
+            failed: Some(false),
+            ..TransactionFilter::default()
+        };
+        let (sql, params) = success.sql_conditions();
+        assert!(sql.contains("t.kind <> 'reserve'"), "{sql}");
+        assert!(params.is_empty());
+        let failed = TransactionFilter {
+            failed: Some(true),
+            ..TransactionFilter::default()
+        };
+        let (sql, _) = failed.sql_conditions();
+        assert!(!sql.contains("'reserve'"), "{sql}");
+    }
 }

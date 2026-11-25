@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use super::models::{
     AccountOverview, AuthUser, BillingConfig, CreditChangeView, MICRO_CREDITS, RequestLog,
-    Reservation, Role, TransactionView, UserView, credential_charge_micro, settlement_notes,
+    Reservation, Role, TransactionFacets, TransactionFilter, TransactionView, UserView,
+    credential_charge_micro, settlement_notes, transaction_scope,
 };
 
 #[derive(Debug)]
@@ -605,18 +606,11 @@ impl AccountStore {
         &self,
         actor: &AuthUser,
         requested_user: Option<i64>,
+        filter: &TransactionFilter,
         limit: u32,
     ) -> Result<Vec<TransactionView>, AccountError> {
         self.ensure_transaction_access(actor, requested_user)?;
-        let user_id = if actor.is_manager() {
-            match requested_user {
-                Some(_) => requested_user,
-                None if actor.role == Role::SuperAdmin => None,
-                None => Some(actor.id),
-            }
-        } else {
-            Some(actor.id)
-        };
+        let user_id = transaction_scope(actor, requested_user);
         let connection = self.connection.lock();
         let sql = "SELECT t.id, t.user_id, u.username, t.kind, t.amount_micro, t.balance_after_micro, t.model,
                    t.input_tokens, t.output_tokens, t.reserved_micro, t.status, t.note, t.created_at, t.completed_at,
@@ -625,24 +619,59 @@ impl AccountStore {
                    t.credential_id, t.cache_creation_input_tokens, t.cache_read_input_tokens
                    FROM credit_transactions t JOIN users u ON u.id = t.user_id
                    LEFT JOIN credit_transactions r ON r.request_id = t.request_id AND r.kind IN ('refund', 'release', 'surcharge')
-                   WHERE t.kind IN ('reserve', 'charge', 'error') ";
-        let order = " ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?1";
-        let mut rows = Vec::new();
+                   WHERE t.kind IN ('reserve', 'charge', 'error')";
+        let (conditions, filter_values) = filter.sql_conditions();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        let mut where_clause = conditions;
         if let Some(user_id) = user_id {
-            let mut statement = connection.prepare(&format!("{sql}AND t.user_id = ?2{order}"))?;
-            let results =
-                statement.query_map(params![limit.min(500) as i64, user_id], transaction_row)?;
-            for row in results {
-                rows.push(row?);
-            }
-        } else {
-            let mut statement = connection.prepare(&format!("{sql}{order}"))?;
-            let results = statement.query_map([limit.min(500) as i64], transaction_row)?;
-            for row in results {
-                rows.push(row?);
-            }
+            where_clause = format!(" AND t.user_id = ?{where_clause}");
+            values.push(user_id.into());
+        }
+        values.extend(filter_values.into_iter().map(rusqlite::types::Value::from));
+        values.push((limit.min(500) as i64).into());
+        let mut statement = connection.prepare(&format!(
+            "{sql}{where_clause} ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?"
+        ))?;
+        let results =
+            statement.query_map(rusqlite::params_from_iter(values), transaction_row)?;
+        let mut rows = Vec::new();
+        for row in results {
+            rows.push(row?);
         }
         Ok(rows)
+    }
+
+    /// 最近 30 天调用记录里出现过的模型和接口，供流水页筛选下拉使用；可见范围同 list_transactions。
+    pub fn transaction_facets(
+        &self,
+        actor: &AuthUser,
+        requested_user: Option<i64>,
+    ) -> Result<TransactionFacets, AccountError> {
+        self.ensure_transaction_access(actor, requested_user)?;
+        let user_id = transaction_scope(actor, requested_user);
+        let since = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let connection = self.connection.lock();
+        let distinct = |column: &str| -> Result<Vec<String>, AccountError> {
+            let mut values: Vec<rusqlite::types::Value> = vec![since.clone().into()];
+            let scope = match user_id {
+                Some(user_id) => {
+                    values.push(user_id.into());
+                    " AND t.user_id = ?"
+                }
+                None => "",
+            };
+            let mut statement = connection.prepare(&format!(
+                "SELECT DISTINCT t.{column} FROM credit_transactions t
+                 WHERE t.kind IN ('reserve', 'charge', 'error') AND t.created_at >= ?{scope}
+                 AND t.{column} IS NOT NULL AND t.{column} <> '' ORDER BY t.{column}"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(values), |row| row.get(0))?;
+            rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
+        };
+        Ok(TransactionFacets {
+            models: distinct("model")?,
+            paths: distinct("path")?,
+        })
     }
 
     pub fn usage_stats(
@@ -942,15 +971,7 @@ impl AccountStore {
         limit: u32,
     ) -> Result<Vec<CreditChangeView>, AccountError> {
         self.ensure_transaction_access(actor, requested_user)?;
-        let user_id = if actor.is_manager() {
-            match requested_user {
-                Some(_) => requested_user,
-                None if actor.role == Role::SuperAdmin => None,
-                None => Some(actor.id),
-            }
-        } else {
-            Some(actor.id)
-        };
+        let user_id = transaction_scope(actor, requested_user);
         let connection = self.connection.lock();
         let sql = "SELECT kind, amount_micro, balance_after_micro, note, created_at, completed_at
                    FROM credit_transactions WHERE request_id IS NULL AND kind IN ('initial', 'adjustment')";
@@ -1222,6 +1243,7 @@ fn now() -> String {
 #[cfg(all(test, not(feature = "mysql")))]
 mod tests {
     use super::*;
+    use crate::accounts::models::TransactionQuery;
 
     fn store() -> AccountStore {
         AccountStore::open(":memory:").unwrap()
@@ -1271,7 +1293,7 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             9_994_000
         );
-        let transactions = store.list_transactions(&user, None, 100).unwrap();
+        let transactions = store.list_transactions(&user, None, &TransactionFilter::default(), 100).unwrap();
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].kind, "charge");
         assert_eq!(transactions[0].amount_micro, -6_000);
@@ -1303,7 +1325,7 @@ mod tests {
             MICRO_CREDITS
         );
         assert_eq!(
-            store.list_transactions(&user, None, 10).unwrap()[0].amount_micro,
+            store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0].amount_micro,
             0
         );
 
@@ -1315,7 +1337,7 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             750_000
         );
-        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let charged = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(charged.amount_micro, -250_000);
         assert_eq!(charged.refund_micro, -190_000);
 
@@ -1327,7 +1349,7 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             0
         );
-        let drained = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let drained = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(drained.amount_micro, -750_000);
         assert!(
             drained
@@ -1350,14 +1372,14 @@ mod tests {
         store
             .settle(&reservation, true, 1, 1, Some(0.25), Some(7), None)
             .unwrap();
-        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let charged = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(charged.credential_id, Some(7));
         // 凭证 ID 只记录，不影响结算金额
         assert_eq!(charged.amount_micro, -250_000);
 
         let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
         store.refund(&reservation, None);
-        let released = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let released = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(released.credential_id, None);
     }
 
@@ -1384,7 +1406,7 @@ mod tests {
         store
             .settle(&reservation, true, 1000, 20, Some(0.25), Some(7), Some(&log))
             .unwrap();
-        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let charged = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(charged.input_tokens, 1000);
         assert_eq!(charged.cache_creation_input_tokens, 300);
         assert_eq!(charged.cache_read_input_tokens, 600);
@@ -1393,9 +1415,158 @@ mod tests {
 
         let reservation = store.reserve(&user, "sonnet", 1000, 1000).unwrap().unwrap();
         store.refund(&reservation, None);
-        let released = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let released = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(released.cache_creation_input_tokens, 0);
         assert_eq!(released.cache_read_input_tokens, 0);
+    }
+
+    /// 造三条调用记录：成功 sonnet /v1/messages、HTTP 失败 opus /v1/messages、被拒 sonnet /cc/v1/messages，
+    /// created_at 分别改到 11-24、11-25、11-26 的 UTC 时间点。
+    fn filter_fixture(store: &AccountStore) -> AuthUser {
+        let manager = manager(store);
+        let (_, key) = store
+            .create_user(&manager, "alice", "password-123", Role::User, 10.0)
+            .unwrap();
+        let user = store.authenticate_key(&key).unwrap().unwrap();
+        let log = |path: &str, model: &str, http_status: u16| RequestLog {
+            path: path.to_string(),
+            model: model.to_string(),
+            stream: false,
+            http_status,
+            error_message: None,
+            duration_ms: 10,
+            first_token_ms: None,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let reservation = store.reserve(&user, "sonnet", 100, 100).unwrap().unwrap();
+        store
+            .settle(&reservation, true, 10, 10, Some(0.01), None, Some(&log("/v1/messages", "sonnet", 200)))
+            .unwrap();
+        let reservation = store.reserve(&user, "opus", 100, 100).unwrap().unwrap();
+        store
+            .settle(&reservation, false, 0, 0, None, None, Some(&log("/v1/messages", "opus", 500)))
+            .unwrap();
+        store.record_rejected_request(&user, "/cc/v1/messages", "sonnet", false, 400, "bad", 1);
+        let connection = store.connection.lock();
+        for (model, path, created_at) in [
+            ("sonnet", "/v1/messages", "2026-11-24T23:59:59.900000000+00:00"),
+            ("opus", "/v1/messages", "2026-11-25T08:31:49.504321098+00:00"),
+            ("sonnet", "/cc/v1/messages", "2026-11-26T00:00:00+00:00"),
+        ] {
+            connection
+                .execute(
+                    "UPDATE credit_transactions SET created_at = ?1 WHERE model = ?2 AND path = ?3 AND kind IN ('charge', 'error')",
+                    params![created_at, model, path],
+                )
+                .unwrap();
+        }
+        user
+    }
+
+    fn filtered(store: &AccountStore, user: &AuthUser, query: TransactionQuery) -> Vec<(String, String)> {
+        store
+            .list_transactions(user, None, &query.filter().unwrap(), 100)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.model.unwrap_or_default(), row.path.unwrap_or_default()))
+            .collect()
+    }
+
+    fn query() -> TransactionQuery {
+        TransactionQuery {
+            user_id: None,
+            limit: None,
+            start: None,
+            end: None,
+            status: None,
+            model: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn transactions_filter_by_start_and_end() {
+        let store = store();
+        let user = filter_fixture(&store);
+        let pair = |model: &str, path: &str| (model.to_string(), path.to_string());
+        // 日期按 UTC 日界：end 当天整天都算，次日零点不算
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { start: Some("2026-11-25".into()), end: Some("2026-11-25".into()), ..query() }),
+            vec![pair("opus", "/v1/messages")]
+        );
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { end: Some("2026-11-24".into()), ..query() }),
+            vec![pair("sonnet", "/v1/messages")]
+        );
+        // 完整时间：start 含边界，end 用 <=
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { start: Some("2026-11-25T08:31:49.504321098Z".into()), end: Some("2026-11-26T00:00:00+00:00".into()), ..query() }),
+            vec![pair("sonnet", "/cc/v1/messages"), pair("opus", "/v1/messages")]
+        );
+        assert!(TransactionQuery { start: Some("yesterday".into()), ..query() }.filter().is_err());
+    }
+
+    #[test]
+    fn transactions_filter_by_status() {
+        let store = store();
+        let user = filter_fixture(&store);
+        // 一条还没结算的预扣：结果未知，成功和失败都不算，但不筛状态时照常列出
+        let _pending = store.reserve(&user, "haiku", 100, 100).unwrap().unwrap();
+        assert!(filtered(&store, &user, query()).iter().any(|(model, _)| model == "haiku"));
+        let failed = filtered(&store, &user, TransactionQuery { status: Some("failed".into()), ..query() });
+        assert_eq!(failed.len(), 2);
+        assert!(failed.iter().all(|(model, path)| model != "sonnet" || path != "/v1/messages"));
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { status: Some("success".into()), ..query() }),
+            vec![("sonnet".to_string(), "/v1/messages".to_string())]
+        );
+        assert!(TransactionQuery { status: Some("ok".into()), ..query() }.filter().is_err());
+    }
+
+    #[test]
+    fn transactions_filter_by_model_and_path() {
+        let store = store();
+        let user = filter_fixture(&store);
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { model: Some("opus".into()), ..query() }),
+            vec![("opus".to_string(), "/v1/messages".to_string())]
+        );
+        assert_eq!(
+            filtered(&store, &user, TransactionQuery { model: Some("sonnet".into()), path: Some("/v1/messages".into()), ..query() }),
+            vec![("sonnet".to_string(), "/v1/messages".to_string())]
+        );
+        assert_eq!(filtered(&store, &user, TransactionQuery { model: Some("haiku".into()), ..query() }).len(), 0);
+    }
+
+    #[test]
+    fn transaction_facets_are_distinct_and_recent() {
+        let store = store();
+        let user = filter_fixture(&store);
+        {
+            // 把 fixture 的时间改回最近，并加一条 31 天前的旧记录
+            let connection = store.connection.lock();
+            connection
+                .execute("UPDATE credit_transactions SET created_at = ?1", [now()])
+                .unwrap();
+        }
+        store.record_rejected_request(&user, "/old", "old-model", false, 400, "bad", 1);
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE credit_transactions SET created_at = ?1 WHERE path = '/old'",
+                [(Utc::now() - chrono::Duration::days(31)).to_rfc3339()],
+            )
+            .unwrap();
+        let facets = store.transaction_facets(&user, None).unwrap();
+        assert_eq!(facets.models, vec!["opus".to_string(), "sonnet".to_string()]);
+        assert_eq!(
+            facets.paths,
+            vec!["/cc/v1/messages".to_string(), "/v1/messages".to_string()]
+        );
+        // 普通用户不能看别人的
+        assert!(store.transaction_facets(&user, Some(user.id + 100)).is_err());
     }
 
     #[test]
@@ -1426,7 +1597,7 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             8_800_000
         );
-        let charged = &store.list_transactions(&user, None, 10).unwrap()[0];
+        let charged = &store.list_transactions(&user, None, &TransactionFilter::default(), 10).unwrap()[0];
         assert_eq!(charged.amount_micro, -1_200_000);
         assert_eq!(
             charged.note.as_deref(),
@@ -1449,7 +1620,7 @@ mod tests {
             store.authenticate_key(&key).unwrap().unwrap().balance_micro,
             MICRO_CREDITS
         );
-        let transactions = store.list_transactions(&user, None, 100).unwrap();
+        let transactions = store.list_transactions(&user, None, &TransactionFilter::default(), 100).unwrap();
         assert_eq!(transactions.len(), 1);
         assert!(transactions[0].is_legacy_failure() || transactions[0].refund_micro == 6_000);
         assert_eq!(transactions[0].amount_micro, 0);
@@ -1468,7 +1639,7 @@ mod tests {
             store.reserve(&user, "sonnet", 100, 100),
             Err(AccountError::InsufficientCredits { .. })
         ));
-        assert_eq!(store.list_transactions(&user, None, 100).unwrap().len(), 0);
+        assert_eq!(store.list_transactions(&user, None, &TransactionFilter::default(), 100).unwrap().len(), 0);
     }
 
     #[test]

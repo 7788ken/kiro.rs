@@ -88,6 +88,7 @@ fn transactions(state: &AccountState, key: &str) -> Vec<super::models::Transacti
         .list_transactions(
             &state.store.authenticate_key(key).unwrap().unwrap(),
             None,
+            &super::models::TransactionFilter::default(),
             20,
         )
         .unwrap()

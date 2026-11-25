@@ -23,8 +23,25 @@ export async function getAccount(): Promise<AccountOverview> {
   return data
 }
 
-export async function getTransactions(userId?: number): Promise<CreditTransaction[]> {
-  const { data } = await accountApi.get<CreditTransaction[]>('/account/transactions', { params: { userId, limit: 200 } })
+export interface TransactionFilters {
+  userId?: number
+  /** RFC3339 或 YYYY-MM-DD（按 UTC 日界） */
+  start?: string
+  end?: string
+  status?: 'success' | 'failed'
+  model?: string
+  path?: string
+  limit?: number
+}
+
+export async function getTransactions(filters: TransactionFilters = {}): Promise<CreditTransaction[]> {
+  const params = Object.fromEntries(Object.entries({ limit: 200, ...filters }).filter(([, value]) => value !== undefined && value !== ''))
+  const { data } = await accountApi.get<CreditTransaction[]>('/account/transactions', { params })
+  return data
+}
+
+export async function getTransactionFacets(userId?: number): Promise<{ models: string[]; paths: string[] }> {
+  const { data } = await accountApi.get<{ models: string[]; paths: string[] }>('/account/transactions/facets', { params: { userId } })
   return data
 }
 
