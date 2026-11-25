@@ -518,20 +518,30 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
+模型名按规则转换为 Kiro ID，未在列表中的新模型名可直接使用：
+
+1. 转小写，去掉 `-thinking` 后缀和末尾 8 位日期后缀（如 `-20250929`）。
+2. `claude-<家族>-<主版本>-<次版本>` 转为点号形式 `claude-<家族>-<主版本>.<次版本>`，例如 `claude-fable-5-2` → `claude-fable-5.2`。
+3. 其它以 `claude-` 开头的名字（含已是点号形式的名字、`claude-opus-5` 这类只有主版本的名字）原样透传，是否可用由上游决定；不以 `claude-` 开头的名字返回「模型不支持」。
+
+上下文窗口：Fable 全系列、Opus / Sonnet 4.6 及以上为 1M，其余为 200K。
+
+已验证可用：
+
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
-| `*fable*` | `claude-fable-5.1` |
-| `*sonnet-5-5*` / `*sonnet-5.5*` | `claude-sonnet-5.5` |
-| `*sonnet-5*` | `claude-sonnet-5` |
-| `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
-| `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
-| `*opus-5-5*` / `*opus-5.5*` | `claude-opus-5.5` |
-| `*opus-5*` | `claude-opus-5` |
-| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
-| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
-| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*haiku*` | `claude-haiku-4.5` |
+| `claude-fable-5-1` / `claude-fable-5.1` | `claude-fable-5.1` |
+| `claude-sonnet-5-5` / `claude-sonnet-5.5` | `claude-sonnet-5.5` |
+| `claude-sonnet-5` | `claude-sonnet-5` |
+| `claude-sonnet-4-6` / `claude-sonnet-4.6` | `claude-sonnet-4.6` |
+| `claude-sonnet-4-5-20250929` / `claude-sonnet-4.5` | `claude-sonnet-4.5` |
+| `claude-opus-5-5` / `claude-opus-5.5` | `claude-opus-5.5` |
+| `claude-opus-5` | `claude-opus-5` |
+| `claude-opus-4-8` / `claude-opus-4.8` | `claude-opus-4.8` |
+| `claude-opus-4-7` / `claude-opus-4.7` | `claude-opus-4.7` |
+| `claude-opus-4-6` / `claude-opus-4.6` | `claude-opus-4.6` |
+| `claude-opus-4-5-20251101` / `claude-opus-4.5` | `claude-opus-4.5` |
+| `claude-haiku-4-5-20251001` / `claude-haiku-4.5` | `claude-haiku-4.5` |
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
 

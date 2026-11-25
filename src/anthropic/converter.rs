@@ -92,74 +92,79 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将 Anthropic 模型名按规则转换为 Kiro 模型 ID
+///
+/// 规则（新模型无需改代码）：
+/// 1. 转小写，去掉 `-thinking` 后缀，再去掉末尾 8 位日期后缀 `-YYYYMMDD`
+/// 2. `claude-<family>-<major>-<minor>` 转为 `claude-<family>-<major>.<minor>`
+///    （如 `claude-fable-5-2` → `claude-fable-5.2`；Kiro 只认点号形式）
+/// 3. 其它以 `claude-` 开头的名字（含点号形式、`claude-<family>-<major>`）原样透传，
+///    由上游判断是否可用
+/// 4. 不以 `claude-` 开头的返回 `None`
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
-
-    if model_lower.contains("fable") {
-        // Kiro 侧 ID 为点号形式 claude-fable-5.1（实测 claude-fable-5-1 / claude-fable-5 均被上游拒绝）
-        // 目前 Kiro 仅上线 5.1 一个 Fable 版本，故与 haiku 分支一致采用无条件映射
-        Some("claude-fable-5.1".to_string())
-    } else if model_lower.contains("sonnet") {
-        // 5.5 必须先于 sonnet-5 判断：`contains("sonnet-5")` 会同时匹配 sonnet-5.5
-        if model_lower.contains("sonnet-5-5") || model_lower.contains("sonnet-5.5") {
-            Some("claude-sonnet-5.5".to_string())
-        } else if model_lower.contains("sonnet-5") {
-            Some("claude-sonnet-5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
+    let mut name = model_lower
+        .strip_suffix("-thinking")
+        .unwrap_or(&model_lower);
+    if let Some((head, last)) = name.rsplit_once('-') {
+        if last.len() == 8 && is_ascii_digits(last) {
+            name = head;
         }
-    } else if model_lower.contains("opus") {
-        // 5.5 必须先于 opus-5 判断：`contains("opus-5")` 会同时匹配 opus-5.5
-        if model_lower.contains("opus-5-5") || model_lower.contains("opus-5.5") {
-            Some("claude-opus-5.5".to_string())
-        } else if model_lower.contains("opus-5") {
-            Some("claude-opus-5".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
     }
+
+    // 去掉后缀后必须仍是 `claude-` 加非空内容
+    if name.strip_prefix("claude-").is_none_or(str::is_empty) {
+        return None;
+    }
+
+    if let ["claude", family, major, minor] = name.split('-').collect::<Vec<_>>()[..] {
+        if is_ascii_letters(family) && is_ascii_digits(major) && is_ascii_digits(minor) {
+            return Some(format!("claude-{family}-{major}.{minor}"));
+        }
+    }
+
+    Some(name.to_string())
+}
+
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_ascii_letters(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// 从 Kiro 模型 ID（`claude-<family>-<major>[.<minor>]`）解析出 `(family, major, minor)`
+///
+/// 无 minor 时按 0 处理；格式不符返回 `None`。
+fn parse_model_version(model_id: &str) -> Option<(&str, u32, u32)> {
+    let (family, version) = model_id.strip_prefix("claude-")?.split_once('-')?;
+    if !is_ascii_letters(family) {
+        return None;
+    }
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    if !is_ascii_digits(major) || !is_ascii_digits(minor) {
+        return None;
+    }
+    Some((family, major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
+/// 先经 `map_model` 转换，再按家族和版本号判断：
+/// - Fable 任何版本 → 1M
+/// - Opus / Sonnet ≥ 4.6（Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M） → 1M
+/// - 其余（Haiku、Opus/Sonnet 4.5 及更低、无法解析的名字） → 200K
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-fable-5.1"
-                || mapped == "claude-sonnet-5.5"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-5.5"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
-    }
+    let is_1m = map_model(model)
+        .as_deref()
+        .and_then(parse_model_version)
+        .is_some_and(|(family, major, minor)| match family {
+            "fable" => true,
+            "opus" | "sonnet" => major >= 5 || (major == 4 && minor >= 6),
+            _ => false,
+        });
+    if is_1m { 1_000_000 } else { 200_000 }
 }
 
 /// 转换结果
@@ -1004,10 +1009,14 @@ mod tests {
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
+        assert_eq!(
+            map_model("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        // haiku 不再无条件压到 4.5，按规则透传
+        assert_eq!(
+            map_model("claude-haiku-4-20250514"),
+            Some("claude-haiku-4".to_string())
         );
     }
 
@@ -1015,13 +1024,30 @@ mod tests {
     fn test_map_model_unsupported() {
         for model in [
             "gpt-4",
-            "claude-sonnet-4",
-            "claude-sonnet-4-20250514",
-            "claude-3-5-sonnet-20241022",
-            "claude-opus-4",
-            "claude-opus-4-20250514",
+            "claude",
+            "claude-",
+            "claude-20250514",
+            "Claude-thinking",
         ] {
             assert_eq!(map_model(model), None, "{model}");
+        }
+    }
+
+    #[test]
+    fn test_map_model_passthrough() {
+        // 以 claude- 开头的名字不再拒绝：去日期后缀、横杠版本转点号后透传，由上游判断
+        for (model, expected) in [
+            ("claude-sonnet-4", "claude-sonnet-4"),
+            ("claude-sonnet-4-20250514", "claude-sonnet-4"),
+            ("claude-opus-4", "claude-opus-4"),
+            ("claude-opus-4-20250514", "claude-opus-4"),
+            ("claude-3-5-sonnet-20241022", "claude-3-5-sonnet"),
+            ("claude-sonnet-7", "claude-sonnet-7"),
+            ("claude-opus-6-1-thinking", "claude-opus-6.1"),
+            ("CLAUDE-Opus-6-1", "claude-opus-6.1"),
+            ("claude-sonnet-4-5-20250929-thinking", "claude-sonnet-4.5"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
         }
     }
 
@@ -1084,6 +1110,23 @@ mod tests {
             map_model("claude-sonnet-4-5-20250929"),
             Some("claude-sonnet-4.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_map_model_fable_5_2() {
+        // 5.2 不再被压成 5.1
+        for name in [
+            "claude-fable-5-2",
+            "claude-fable-5.2",
+            "claude-fable-5-2-thinking",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-fable-5.2".to_string()),
+                "{name} should map to claude-fable-5.2"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-fable-5-2"), 1_000_000);
     }
 
     #[test]
@@ -1162,6 +1205,25 @@ mod tests {
             Some("claude-opus-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_get_context_window_size_by_version() {
+        for (model, expected) in [
+            ("claude-opus-6", 1_000_000),
+            ("claude-sonnet-7", 1_000_000),
+            ("claude-fable-5-2", 1_000_000),
+            ("claude-opus-4-6", 1_000_000),
+            ("claude-sonnet-4-6", 1_000_000),
+            ("claude-opus-4-5-20251101", 200_000),
+            ("claude-sonnet-4-5-20250929", 200_000),
+            ("claude-sonnet-4", 200_000),
+            ("claude-haiku-4-5-20251001", 200_000),
+            ("claude-3-5-sonnet-20241022", 200_000),
+            ("gpt-4", 200_000),
+        ] {
+            assert_eq!(get_context_window_size(model), expected, "{model}");
+        }
     }
 
     #[test]
