@@ -337,7 +337,7 @@ fn default_consumption_ratio() -> f64 {
     1.0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingConfig {
     pub input_per_million: f64,

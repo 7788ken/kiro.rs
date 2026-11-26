@@ -164,6 +164,20 @@ pub struct Config {
     #[serde(default)]
     pub prompt_cache_mode: PromptCacheMode,
 
+    /// 是否把扣费与刊例价的差额折算成输出 token 上报（默认 false）
+    ///
+    /// 缓存读取按官方刊例只算普通输入的约 1/10，而扣费锚定凭证真实消耗，
+    /// 客户端照 usage 自行估算的金额会远低于实际扣费。开启后把差额折成输出补上，
+    /// 输入与缓存三项保持真实，上下文总量不膨胀。只改上报，不影响扣费。
+    #[serde(default)]
+    pub correct_output_for_cache_price: bool,
+
+    /// 补正目标倍数（默认 1，即补到与扣费持平）
+    ///
+    /// 1.2 表示补到扣费的 1.2 倍。仅在 `correct_output_for_cache_price` 开启时生效。
+    #[serde(default = "default_output_correction_target")]
+    pub output_correction_target: f64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -206,6 +220,11 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+/// 补正目标倍数默认值：补到与扣费持平
+fn default_output_correction_target() -> f64 {
+    1.0
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -245,6 +264,8 @@ impl Default for Config {
             enforce_max_tokens: false,
             input_token_source: InputTokenSource::default(),
             prompt_cache_mode: PromptCacheMode::default(),
+            correct_output_for_cache_price: false,
+            output_correction_target: default_output_correction_target(),
             config_path: None,
         }
     }
