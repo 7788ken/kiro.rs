@@ -65,6 +65,28 @@ impl CacheSplit {
         }
     }
 
+    /// 按配置的口径选定上报总量，再做拆分。
+    ///
+    /// `upstream_total` 是上游上下文占用百分比换算出的值，含整段会话的累计占用；
+    /// `Local` 与 `Min` 用本地估算把它压回本次请求的量级。
+    pub fn apply_with_source(
+        &self,
+        upstream_total: i32,
+        source: crate::model::config::InputTokenSource,
+    ) -> UsageTokens {
+        use crate::model::config::InputTokenSource;
+        let local = self.total_local.clamp(0, i64::from(i32::MAX)) as i32;
+        let total = match source {
+            InputTokenSource::Upstream => upstream_total,
+            // 本地估算为 0（例如空请求）时没有可用口径，退回上游值
+            InputTokenSource::Local if local > 0 => local,
+            InputTokenSource::Local => upstream_total,
+            InputTokenSource::Min if local > 0 => upstream_total.min(local),
+            InputTokenSource::Min => upstream_total,
+        };
+        self.apply(total)
+    }
+
     /// 把本地口径按比例缩放到真实总量 `actual_total`。
     ///
     /// 三者之和 == `actual_total.max(1)`，且 `input_tokens >= 1`
@@ -116,6 +138,22 @@ impl UsageTokens {
 pub fn simulate(payload: &MessagesRequest) -> CacheSplit {
     static CACHE: LazyLock<PromptCache> = LazyLock::new(PromptCache::new);
     CACHE.simulate_at(payload, Instant::now())
+}
+
+/// 按配置模拟缓存：`Disabled` 不读写全局缓存表，输入全部计为普通输入
+pub fn simulate_with_mode(
+    payload: &MessagesRequest,
+    mode: crate::model::config::PromptCacheMode,
+) -> CacheSplit {
+    use crate::model::config::PromptCacheMode;
+    match mode {
+        PromptCacheMode::Simulated => simulate(payload),
+        PromptCacheMode::Disabled => CacheSplit::none(token::count_all_tokens_local(
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i64),
+    }
 }
 
 /// 一个 block 边界：前缀哈希 + 前缀本地 token 数 + 是否为断点（带 `cache_control`）
@@ -378,6 +416,56 @@ mod tests {
         assert!(cache.entries.lock().is_empty());
         let usage = split.apply(500);
         assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn input_token_source_picks_reported_total() {
+        use crate::model::config::InputTokenSource;
+        // 本地估算 1000，上游换算值 50000（含整段会话累计占用）
+        let split = CacheSplit::from_parts(1000, 600, 300);
+
+        let upstream = split.apply_with_source(50_000, InputTokenSource::Upstream);
+        let upstream_sum = upstream.input_tokens
+            + upstream.cache_creation_input_tokens
+            + upstream.cache_read_input_tokens;
+        assert_eq!(upstream_sum, 50_000);
+
+        let local = split.apply_with_source(50_000, InputTokenSource::Local);
+        let local_sum =
+            local.input_tokens + local.cache_creation_input_tokens + local.cache_read_input_tokens;
+        assert_eq!(local_sum, 1000, "Local 用本地估算压回本次请求量级");
+
+        let min = split.apply_with_source(50_000, InputTokenSource::Min);
+        let min_sum = min.input_tokens + min.cache_creation_input_tokens + min.cache_read_input_tokens;
+        assert_eq!(min_sum, 1000, "Min 取较小者");
+
+        // 上游值更小时 Min 取上游
+        let min_small = split.apply_with_source(400, InputTokenSource::Min);
+        let min_small_sum = min_small.input_tokens
+            + min_small.cache_creation_input_tokens
+            + min_small.cache_read_input_tokens;
+        assert_eq!(min_small_sum, 400);
+
+        // 本地估算为 0 时退回上游值，避免上报 0
+        let empty = CacheSplit::none(0);
+        for source in [InputTokenSource::Local, InputTokenSource::Min] {
+            let usage = empty.apply_with_source(777, source);
+            assert_eq!(usage.input_tokens, 777, "{source:?} 无本地口径时退回上游");
+        }
+    }
+
+    #[test]
+    fn disabled_mode_reports_all_as_plain_input() {
+        use crate::model::config::PromptCacheMode;
+        let payload = base_request(false);
+        let split = simulate_with_mode(&payload, PromptCacheMode::Disabled);
+        assert_eq!(split.read_local, 0);
+        assert_eq!(split.creation_local, 0);
+        assert_eq!(split.total_local, local_total(&payload));
+        let usage = split.apply(1234);
+        assert_eq!(usage.input_tokens, 1234);
         assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, 0);
     }

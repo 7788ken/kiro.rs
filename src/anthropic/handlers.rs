@@ -23,7 +23,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
-use super::middleware::AppState;
+use super::middleware::{AppState, RequestOptions};
 use super::prompt_cache::{self, CacheSplit};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -404,8 +404,11 @@ pub async fn post_messages(
         payload.tools.clone(),
     ) as i32;
 
+    // 请求开始时锁定兼容开关，保存配置不影响在途请求
+    let options = state.request_options();
+
     // 模拟 prompt cache 用量（只用于 usage 展示，不影响扣费）
-    let cache_split = prompt_cache::simulate(&payload);
+    let cache_split = prompt_cache::simulate_with_mode(&payload, options.prompt_cache_mode);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -415,6 +418,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let max_tokens = payload.max_tokens;
 
     if payload.stream {
         // 流式响应
@@ -427,6 +431,8 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             usage,
+            options,
+            max_tokens,
         )
         .await
     } else {
@@ -444,6 +450,8 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             usage,
+            options,
+            max_tokens,
         )
         .await
     }
@@ -459,6 +467,8 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
+    options: RequestOptions,
+    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -474,6 +484,7 @@ async fn handle_stream_request(
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_credential_usage(usage);
     ctx.set_cache_split(cache_split);
+    ctx.set_options(options, Some(max_tokens));
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -603,6 +614,8 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
+    options: RequestOptions,
+    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_with_usage(request_body, &usage).await {
@@ -770,6 +783,15 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
+    // 本地强制 max_tokens：按估算裁掉超出上限的文本，并把 stop_reason 置为 max_tokens。
+    // 工具调用块整块保留，截断会产生不可用的调用。
+    if options.enforce_max_tokens
+        && max_tokens > 0
+        && super::stream::truncate_content_to_limit(&mut content, max_tokens)
+    {
+        stop_reason = "max_tokens".to_string();
+    }
+
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
@@ -785,7 +807,9 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": cache_split.apply(final_input_tokens).to_usage_json(output_tokens)
+        "usage": cache_split
+            .apply_with_source(final_input_tokens, options.input_token_source)
+            .to_usage_json(output_tokens)
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -960,8 +984,11 @@ pub async fn post_messages_cc(
         payload.tools.clone(),
     ) as i32;
 
+    // 请求开始时锁定兼容开关，保存配置不影响在途请求
+    let options = state.request_options();
+
     // 模拟 prompt cache 用量（只用于 usage 展示，不影响扣费）
-    let cache_split = prompt_cache::simulate(&payload);
+    let cache_split = prompt_cache::simulate_with_mode(&payload, options.prompt_cache_mode);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -971,6 +998,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let max_tokens = payload.max_tokens;
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -983,6 +1011,8 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             usage,
+            options,
+            max_tokens,
         )
         .await
     } else {
@@ -1000,6 +1030,8 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             usage,
+            options,
+            max_tokens,
         )
         .await
     }
@@ -1018,6 +1050,8 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
+    options: RequestOptions,
+    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -1037,6 +1071,7 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_credential_usage(usage);
     ctx.set_cache_split(cache_split);
+    ctx.set_options(options, Some(max_tokens));
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::middleware::RequestOptions;
 use super::prompt_cache::{CacheSplit, UsageTokens};
 use crate::accounts::models::CredentialUsage;
 use crate::kiro::model::events::Event;
@@ -539,6 +540,12 @@ pub struct StreamContext {
     credential_usage: CredentialUsage,
     /// 本地模拟的 prompt cache 拆分（只用于 usage 展示）
     pub cache_split: CacheSplit,
+    /// 请求开始时锁定的兼容开关
+    pub options: RequestOptions,
+    /// 客户端请求的 max_tokens；开启本地强制时用于截断
+    pub max_tokens: Option<i32>,
+    /// 输出已达 max_tokens，后续内容不再转发
+    output_limit_reached: bool,
 }
 
 impl StreamContext {
@@ -567,7 +574,24 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             credential_usage: CredentialUsage::new(),
             cache_split: CacheSplit::none(i64::from(input_tokens)),
+            options: RequestOptions::default(),
+            max_tokens: None,
+            output_limit_reached: false,
         }
+    }
+
+    /// 设置本次请求锁定的兼容开关与客户端 max_tokens
+    pub fn set_options(&mut self, options: RequestOptions, max_tokens: Option<i32>) {
+        self.options = options;
+        self.max_tokens = max_tokens;
+    }
+
+    /// 本地强制 max_tokens 时，输出是否已达上限
+    fn output_limit_exceeded(&self) -> bool {
+        self.options.enforce_max_tokens
+            && self
+                .max_tokens
+                .is_some_and(|limit| limit > 0 && self.output_tokens >= limit)
     }
 
     /// 绑定本次请求的凭证消耗收集器。后到的 metering 事件覆盖先前的值。
@@ -592,7 +616,10 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": self.cache_split.apply(self.input_tokens).to_usage_json(1)
+                "usage": self
+                    .cache_split
+                    .apply_with_source(self.input_tokens, self.options.input_token_source)
+                    .to_usage_json(1)
             }
         })
     }
@@ -704,8 +731,23 @@ impl StreamContext {
             return Vec::new();
         }
 
+        // 本地强制 max_tokens：已达上限后丢弃剩余内容，只保留 stop_reason
+        if self.output_limit_reached {
+            return Vec::new();
+        }
+
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
+
+        if self.output_limit_exceeded() {
+            self.output_limit_reached = true;
+            self.state_manager.set_stop_reason("max_tokens");
+            tracing::debug!(
+                limit = self.max_tokens.unwrap_or_default(),
+                output_tokens = self.output_tokens,
+                "本地强制 max_tokens：停止转发后续输出"
+            );
+        }
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1036,6 +1078,10 @@ impl StreamContext {
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            // 工具调用整块到达，截断会产生不可用的调用，所以只记上限不丢内容
+            if self.output_limit_exceeded() {
+                self.output_limit_reached = true;
+            }
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1149,7 +1195,9 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
-        let usage = self.cache_split.apply(final_input_tokens);
+        let usage = self
+            .cache_split
+            .apply_with_source(final_input_tokens, self.options.input_token_source);
         events.extend(
             self.state_manager
                 .generate_final_events(usage, self.output_tokens),
@@ -1211,6 +1259,11 @@ impl BufferedStreamContext {
         self.inner.set_cache_split(cache_split);
     }
 
+    /// 设置本次请求锁定的兼容开关与客户端 max_tokens
+    pub fn set_options(&mut self, options: RequestOptions, max_tokens: Option<i32>) {
+        self.inner.set_options(options, max_tokens);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1252,7 +1305,10 @@ impl BufferedStreamContext {
             .unwrap_or(self.estimated_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens 及缓存字段
-        let usage_tokens = self.inner.cache_split.apply(final_input_tokens);
+        let usage_tokens = self
+            .inner
+            .cache_split
+            .apply_with_source(final_input_tokens, self.inner.options.input_token_source);
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
@@ -1292,11 +1348,109 @@ fn estimate_tokens(text: &str) -> i32 {
     (chinese_tokens + other_tokens).max(1)
 }
 
+/// 把非流式响应的内容裁到 `limit` 个输出 token 以内，返回是否发生了裁剪。
+///
+/// 按 block 顺序累计预算：文本块超预算时按字符边界截断，预算用尽后的文本块整块丢弃。
+/// `tool_use` 块整块保留并计入预算，截断会产生不可用的工具调用。
+pub fn truncate_content_to_limit(content: &mut Vec<Value>, limit: i32) -> bool {
+    if limit <= 0 {
+        return false;
+    }
+    let mut used = 0i32;
+    let mut truncated = false;
+    let mut kept: Vec<Value> = Vec::with_capacity(content.len());
+    for mut block in content.drain(..) {
+        let is_text = matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("text") | Some("thinking")
+        );
+        if !is_text {
+            // 工具调用等非文本块整块保留，只累计预算
+            used = used.saturating_add(estimate_block_tokens(&block));
+            kept.push(block);
+            continue;
+        }
+        let field = if block.get("type").and_then(Value::as_str) == Some("thinking") {
+            "thinking"
+        } else {
+            "text"
+        };
+        let text = block
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let tokens = estimate_tokens(&text);
+        if used.saturating_add(tokens) <= limit {
+            used = used.saturating_add(tokens);
+            kept.push(block);
+            continue;
+        }
+        truncated = true;
+        let remaining = limit - used;
+        if remaining <= 0 {
+            // 预算已用尽，整块丢弃
+            continue;
+        }
+        let cut = truncate_text_to_tokens(&text, remaining);
+        used = limit;
+        if cut.is_empty() {
+            continue;
+        }
+        block[field] = json!(cut);
+        kept.push(block);
+    }
+    *content = kept;
+    truncated
+}
+
+/// 估算单个内容块的输出 token（与 `token::estimate_output_tokens` 同口径）
+fn estimate_block_tokens(block: &Value) -> i32 {
+    let mut total = 0i32;
+    if let Some(text) = block.get("text").and_then(Value::as_str) {
+        total = total.saturating_add(estimate_tokens(text));
+    }
+    if block.get("type").and_then(Value::as_str) == Some("tool_use")
+        && let Some(input) = block.get("input")
+    {
+        let input_str = serde_json::to_string(input).unwrap_or_default();
+        total = total.saturating_add(estimate_tokens(&input_str));
+    }
+    total
+}
+
+/// 按估算口径把文本截到不超过 `limit` 个 token，切点落在字符边界上。
+///
+/// 逐字符累计与 `estimate_tokens` 相同的中英文权重，取仍不超过上限的最长前缀。
+fn truncate_text_to_tokens(text: &str, limit: i32) -> String {
+    if limit <= 0 {
+        return String::new();
+    }
+    let mut chinese = 0i32;
+    let mut other = 0i32;
+    let mut end = 0usize;
+    for (offset, ch) in text.char_indices() {
+        let (next_chinese, next_other) = if ('\u{4E00}'..='\u{9FFF}').contains(&ch) {
+            (chinese + 1, other)
+        } else {
+            (chinese, other + 1)
+        };
+        // 与 estimate_tokens 一致：中文 2/3、其他 1/4，各自向上取整
+        let tokens = ((next_chinese * 2 + 2) / 3 + (next_other + 3) / 4).max(1);
+        if tokens > limit {
+            break;
+        }
+        chinese = next_chinese;
+        other = next_other;
+        end = offset + ch.len_utf8();
+    }
+    text[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
     #[test]
     fn metering_event_is_recorded_for_billing() {
         let usage = CredentialUsage::new();
@@ -1323,6 +1477,98 @@ mod tests {
             },
         ));
         assert_eq!(usage.get(), Some(0.25));
+    }
+
+    fn assistant_event(content: &str) -> Event {
+        Event::AssistantResponse(serde_json::from_value(json!({"content": content})).unwrap())
+    }
+
+    /// 从事件流里取出所有 text_delta 的文本
+    fn collected_text(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data.pointer("/delta/text").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn enforce_max_tokens_stops_stream_and_sets_stop_reason() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, HashMap::new());
+        let options = RequestOptions {
+            enforce_max_tokens: true,
+            ..Default::default()
+        };
+        // 每段 40 个 ASCII 字符 ≈ 10 token，上限 15 token
+        ctx.set_options(options, Some(15));
+        let chunk = "a".repeat(40);
+
+        let first = ctx.process_kiro_event(&assistant_event(&chunk));
+        assert!(!collected_text(&first).is_empty(), "首段应正常转发");
+
+        let second = ctx.process_kiro_event(&assistant_event(&chunk));
+        assert!(!collected_text(&second).is_empty(), "达到上限的那段仍然转发");
+
+        let third = ctx.process_kiro_event(&assistant_event(&chunk));
+        assert!(collected_text(&third).is_empty(), "超出上限后不再转发内容");
+
+        let events = ctx.generate_final_events();
+        let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn disabled_enforcement_keeps_forwarding_past_max_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, HashMap::new());
+        // 开关关闭（默认），即使超过 max_tokens 也照常转发
+        ctx.set_options(RequestOptions::default(), Some(1));
+        let chunk = "a".repeat(40);
+        for _ in 0..3 {
+            let events = ctx.process_kiro_event(&assistant_event(&chunk));
+            assert!(!collected_text(&events).is_empty());
+        }
+        let events = ctx.generate_final_events();
+        let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_ne!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn truncate_content_respects_limit_and_keeps_tool_use() {
+        // 文本超限：裁剪并报告发生了截断
+        let mut content = vec![json!({"type": "text", "text": "a".repeat(400)})];
+        assert!(truncate_content_to_limit(&mut content, 10));
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(estimate_tokens(text) <= 10, "裁剪后不超过上限");
+        assert!(!text.is_empty());
+
+        // 未超限：原样保留
+        let mut small = vec![json!({"type": "text", "text": "hello"})];
+        assert!(!truncate_content_to_limit(&mut small, 100));
+        assert_eq!(small[0]["text"], "hello");
+
+        // 工具调用块整块保留，预算用尽后的文本块丢弃
+        let mut mixed = vec![
+            json!({"type": "text", "text": "a".repeat(400)}),
+            json!({"type": "tool_use", "id": "t1", "name": "run", "input": {"cmd": "ls"}}),
+            json!({"type": "text", "text": "tail"}),
+        ];
+        assert!(truncate_content_to_limit(&mut mixed, 10));
+        assert!(
+            mixed.iter().any(|b| b["type"] == "tool_use"),
+            "工具调用不能被丢弃：{mixed:?}"
+        );
+        assert!(
+            !mixed.iter().any(|b| b["text"] == "tail"),
+            "预算用尽后的文本块应丢弃：{mixed:?}"
+        );
+
+        // 多字节字符按字符边界切，不 panic
+        let mut cjk = vec![json!({"type": "text", "text": "中文内容".repeat(50)})];
+        assert!(truncate_content_to_limit(&mut cjk, 5));
+        let cut = cjk[0]["text"].as_str().unwrap();
+        assert!(estimate_tokens(cut) <= 5);
     }
 
     fn usage_of<'a>(events: &'a [SseEvent], name: &str) -> &'a serde_json::Value {

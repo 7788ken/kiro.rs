@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { AlertTriangle, ExternalLink, ImageIcon, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react'
+import { AlertTriangle, ExternalLink, ImageIcon, RefreshCw, Save, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react'
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
@@ -30,7 +30,24 @@ type CoreConfig = {
   proxyPasswordSet: boolean
   siteName: string | null
   logoDataUrl: string | null
+  enforceMaxTokens: boolean
+  inputTokenSource: InputTokenSource
+  promptCacheMode: PromptCacheMode
 }
+
+type InputTokenSource = 'upstream' | 'local' | 'min'
+type PromptCacheMode = 'simulated' | 'disabled'
+
+const INPUT_TOKEN_SOURCES: { value: InputTokenSource; label: string; hint: string }[] = [
+  { value: 'upstream', label: '上游口径', hint: '上游只返回上下文占用百分比，换算值含整段会话的累计占用，同一会话越聊越高' },
+  { value: 'local', label: '本地估算', hint: '按本次请求的消息、系统提示和工具定义分词估算，反映单次输入量' },
+  { value: 'min', label: '取较小值', hint: '两者取小，兼顾上游真实度与单次输入量级' },
+]
+
+const PROMPT_CACHE_MODES: { value: PromptCacheMode; label: string; hint: string }[] = [
+  { value: 'simulated', label: '模拟缓存', hint: '按本地断点规则拆出缓存读写，上报的三项之和不变' },
+  { value: 'disabled', label: '不模拟', hint: '输入全部计为普通输入，缓存读写恒为 0' },
+]
 
 const LOGO_ACCEPT = 'image/svg+xml,image/png,image/jpeg,image/x-icon,image/webp'
 const LOGO_MIME_TYPES = LOGO_ACCEPT.split(',')
@@ -157,6 +174,11 @@ export function CoreConfigPanel() {
         <div className="space-y-2"><label htmlFor="core-tls" className="text-sm font-medium">TLS 后端</label><select id="core-tls" className={formControlClass} value={form.tlsBackend} onChange={event => update('tlsBackend', event.target.value as CoreConfig['tlsBackend'])}><option value="rustls">Rustls</option><option value="native-tls">Native TLS</option></select></div>
         <div className="flex min-h-10 items-center justify-between gap-4 rounded-lg bg-muted/35 px-3 py-2 md:mt-7"><div><label htmlFor="core-thinking" className="text-sm font-medium">提取非流式 Thinking</label><p className="mt-0.5 text-xs text-muted-foreground">将标签转换为独立 Thinking 块</p></div><Switch id="core-thinking" checked={form.extractThinking} onCheckedChange={checked => update('extractThinking', checked)} /></div>
       </CardContent></Card>
+      <Card><CardHeader><CardTitle className="flex items-center gap-2 text-base"><SlidersHorizontal className="h-4 w-4" />客户端兼容</CardTitle><CardDescription>只改变上报给客户端的用量口径和输出长度约束，不影响按凭证真实消耗扣费。开关在请求开始时锁定，保存不影响在途请求。</CardDescription></CardHeader><CardContent className="grid gap-4 md:grid-cols-2">
+        <div className="flex min-h-10 items-start justify-between gap-4 rounded-lg bg-muted/35 px-3 py-2 md:col-span-2"><div><label htmlFor="core-enforce-max-tokens" className="text-sm font-medium">本地强制 max_tokens</label><p className="mt-0.5 text-pretty text-xs text-muted-foreground">上游 Kiro 协议没有 max_tokens 字段，客户端传的值默认只用于预扣，不约束生成。开启后输出达到该上限即停止转发后续内容，并把 stop_reason 置为 max_tokens；工具调用块整块保留，避免产生不可用的调用。</p></div><Switch id="core-enforce-max-tokens" checked={form.enforceMaxTokens} onCheckedChange={checked => update('enforceMaxTokens', checked)} /></div>
+        <div className="space-y-2"><label htmlFor="core-input-source" className="text-sm font-medium">输入 Token 口径</label><select id="core-input-source" className={formControlClass} value={form.inputTokenSource} onChange={event => update('inputTokenSource', event.target.value as InputTokenSource)}>{INPUT_TOKEN_SOURCES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select><p className="text-pretty text-xs text-muted-foreground">{INPUT_TOKEN_SOURCES.find(item => item.value === form.inputTokenSource)?.hint}</p></div>
+        <div className="space-y-2"><label htmlFor="core-cache-mode" className="text-sm font-medium">Prompt Cache 模式</label><select id="core-cache-mode" className={formControlClass} value={form.promptCacheMode} onChange={event => update('promptCacheMode', event.target.value as PromptCacheMode)}>{PROMPT_CACHE_MODES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select><p className="text-pretty text-xs text-muted-foreground">{PROMPT_CACHE_MODES.find(item => item.value === form.promptCacheMode)?.hint}</p></div>
+      </CardContent></Card>
       <Card><CardHeader><CardTitle className="text-base">全局代理</CardTitle><CardDescription>凭据级代理优先。密钥不会回显；密码留空保留原值，也可选择清除认证。</CardDescription></CardHeader><CardContent className="grid gap-4 md:grid-cols-2">
         <Field id="core-proxy-url" label="代理 URL（留空直连）" value={form.proxyUrl || ''} onChange={value => update('proxyUrl', value || null)} placeholder="http://host:port 或 socks5://host:port" />
         <Field id="core-proxy-username" label="代理用户名（可选）" value={form.proxyUsername || ''} onChange={value => update('proxyUsername', value || null)} />
@@ -165,7 +187,7 @@ export function CoreConfigPanel() {
       </CardContent></Card>
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/35 px-4 py-3"><p className="text-pretty text-xs leading-5 text-muted-foreground">密钥、管理员密码、数据库地址和监听地址不会在此页面展示或修改。若其他管理员已保存新版本，系统会要求先刷新，避免覆盖。</p><Button type="submit" disabled={mutation.isPending}><Save />{mutation.isPending ? '保存中…' : '保存并热重载'}</Button></div>
     </form>
-    {confirmOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="core-confirm-title"><Card className="w-full max-w-md"><CardHeader><CardTitle id="core-confirm-title">确认切换核心配置？</CardTitle><CardDescription>保存后立即对新请求生效。Region、Kiro 版本、端点、代理或 TLS 的变化可能影响上游连通性，请确认当前填写内容。</CardDescription></CardHeader><CardContent><div className="mb-4 space-y-1 text-sm"><p>站点名称：<span className="font-mono">{form.siteName?.trim() || DEFAULT_SITE_NAME}</span></p><p>Region：<span className="font-mono">{form.region}</span></p><p>Kiro 版本：<span className="font-mono">{form.kiroVersion}</span></p><p>默认端点：<span className="font-mono">{form.defaultEndpoint}</span></p><p>全局代理：<span className="font-mono">{form.proxyUrl || '直连'}</span></p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setConfirmOpen(false)}>返回检查</Button><Button onClick={() => { setConfirmOpen(false); mutation.mutate(form) }}>确认保存并切换</Button></div></CardContent></Card></div>}
+    {confirmOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="core-confirm-title"><Card className="w-full max-w-md"><CardHeader><CardTitle id="core-confirm-title">确认切换核心配置？</CardTitle><CardDescription>保存后立即对新请求生效。Region、Kiro 版本、端点、代理或 TLS 的变化可能影响上游连通性，请确认当前填写内容。</CardDescription></CardHeader><CardContent><div className="mb-4 space-y-1 text-sm"><p>站点名称：<span className="font-mono">{form.siteName?.trim() || DEFAULT_SITE_NAME}</span></p><p>Region：<span className="font-mono">{form.region}</span></p><p>Kiro 版本：<span className="font-mono">{form.kiroVersion}</span></p><p>默认端点：<span className="font-mono">{form.defaultEndpoint}</span></p><p>全局代理：<span className="font-mono">{form.proxyUrl || '直连'}</span></p><p>强制 max_tokens：<span className="font-mono">{form.enforceMaxTokens ? '开启' : '关闭'}</span></p><p>输入 Token 口径：<span className="font-mono">{INPUT_TOKEN_SOURCES.find(item => item.value === form.inputTokenSource)?.label}</span></p><p>Prompt Cache：<span className="font-mono">{PROMPT_CACHE_MODES.find(item => item.value === form.promptCacheMode)?.label}</span></p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setConfirmOpen(false)}>返回检查</Button><Button onClick={() => { setConfirmOpen(false); mutation.mutate(form) }}>确认保存并切换</Button></div></CardContent></Card></div>}
   </PageSection>
 }
 

@@ -16,6 +16,17 @@ use crate::{accounts::AccountState, common::auth};
 
 use super::types::ErrorResponse;
 
+/// 请求开始时锁定的兼容开关快照，整个请求期间不变
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestOptions {
+    /// 本地强制执行客户端的 max_tokens
+    pub enforce_max_tokens: bool,
+    /// 上报输入 token 的口径
+    pub input_token_source: crate::model::config::InputTokenSource,
+    /// prompt cache 模拟模式
+    pub prompt_cache_mode: crate::model::config::PromptCacheMode,
+}
+
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +40,8 @@ pub struct AppState {
     /// 账户服务，用于用户鉴权和积分计费
     pub accounts: Option<AccountState>,
     pub tracker: crate::admin::RequestTracker,
+    /// 运行时配置，用于读取请求级开关（保存核心配置时整体替换，自动随热重载生效）
+    pub runtime_config: Option<Arc<crate::runtime_config::RuntimeConfig>>,
 }
 
 impl AppState {
@@ -42,6 +55,7 @@ impl AppState {
             )),
             accounts: None,
             tracker: crate::admin::RequestTracker::new(),
+            runtime_config: None,
         }
     }
 
@@ -49,6 +63,30 @@ impl AppState {
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(RwLock::new(Arc::new(provider))));
         self
+    }
+
+    /// 注入运行时配置
+    pub fn with_runtime_config(
+        mut self,
+        runtime_config: Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+
+    /// 请求级开关快照；未注入运行时配置时取默认值
+    pub fn request_options(&self) -> RequestOptions {
+        match &self.runtime_config {
+            Some(runtime) => {
+                let config = runtime.get();
+                RequestOptions {
+                    enforce_max_tokens: config.enforce_max_tokens,
+                    input_token_source: config.input_token_source,
+                    prompt_cache_mode: config.prompt_cache_mode,
+                }
+            }
+            None => RequestOptions::default(),
+        }
     }
 
     pub fn with_accounts(mut self, accounts: AccountState) -> Self {
@@ -175,7 +213,7 @@ mod tests {
         let accounts =
             AccountState::new(Arc::new(store), ADMIN_KEY).with_legacy_api_key(LEGACY_API_KEY);
         (
-            crate::anthropic::create_router_with_accounts(None, false, accounts),
+            crate::anthropic::create_router_with_accounts(None, false, accounts, None),
             user_key,
         )
     }
