@@ -431,8 +431,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             usage,
-            options,
-            max_tokens,
+            options.with_max_tokens(max_tokens),
         )
         .await
     } else {
@@ -450,8 +449,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             usage,
-            options,
-            max_tokens,
+            options.with_max_tokens(max_tokens),
         )
         .await
     }
@@ -468,7 +466,6 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
     options: RequestOptions,
-    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -484,7 +481,7 @@ async fn handle_stream_request(
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_credential_usage(usage);
     ctx.set_cache_split(cache_split);
-    ctx.set_options(options, Some(max_tokens));
+    ctx.set_options(options);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -615,7 +612,6 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
     options: RequestOptions,
-    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_with_usage(request_body, &usage).await {
@@ -783,11 +779,13 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 本地强制 max_tokens：按估算裁掉超出上限的文本，并把 stop_reason 置为 max_tokens。
-    // 工具调用块整块保留，截断会产生不可用的调用。
+    // 本地强制 max_tokens：按上报口径裁掉超出上限的文本，并把 stop_reason 置为 max_tokens。
+    // 工具调用块整块保留，截断会产生不可用的调用；因此保留了工具调用时仍报 tool_use，
+    // 否则客户端会按「被截断」处理而不执行工具。
     if options.enforce_max_tokens
-        && max_tokens > 0
-        && super::stream::truncate_content_to_limit(&mut content, max_tokens)
+        && options.max_tokens > 0
+        && super::stream::truncate_content_to_limit(&mut content, options.max_tokens)
+        && !has_tool_use
     {
         stop_reason = "max_tokens".to_string();
     }
@@ -1011,8 +1009,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             usage,
-            options,
-            max_tokens,
+            options.with_max_tokens(max_tokens),
         )
         .await
     } else {
@@ -1030,8 +1027,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             usage,
-            options,
-            max_tokens,
+            options.with_max_tokens(max_tokens),
         )
         .await
     }
@@ -1051,7 +1047,6 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: CredentialUsage,
     options: RequestOptions,
-    max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
@@ -1071,7 +1066,7 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_credential_usage(usage);
     ctx.set_cache_split(cache_split);
-    ctx.set_options(options, Some(max_tokens));
+    ctx.set_options(options);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

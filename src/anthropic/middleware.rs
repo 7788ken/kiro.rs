@@ -25,6 +25,16 @@ pub struct RequestOptions {
     pub input_token_source: crate::model::config::InputTokenSource,
     /// prompt cache 模拟模式
     pub prompt_cache_mode: crate::model::config::PromptCacheMode,
+    /// 客户端请求的 max_tokens，`enforce_max_tokens` 开启时作为输出上限
+    pub max_tokens: i32,
+}
+
+impl RequestOptions {
+    /// 带上客户端这次请求的 max_tokens
+    pub fn with_max_tokens(mut self, max_tokens: i32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
 }
 
 /// 应用共享状态
@@ -83,6 +93,7 @@ impl AppState {
                     enforce_max_tokens: config.enforce_max_tokens,
                     input_token_source: config.input_token_source,
                     prompt_cache_mode: config.prompt_cache_mode,
+                    max_tokens: 0,
                 }
             }
             None => RequestOptions::default(),
@@ -96,8 +107,7 @@ impl AppState {
     }
 }
 
-const MANAGER_CHAT_FORBIDDEN: &str =
-    "管理员账户的 API Key 不能调用对话接口，请使用普通用户的 Key";
+const MANAGER_CHAT_FORBIDDEN: &str = "管理员账户的 API Key 不能调用对话接口，请使用普通用户的 Key";
 
 /// 是否为对话接口（`/v1/messages`、`/cc/v1/messages`，不含 `count_tokens`）
 fn is_chat_path(path: &str) -> bool {
@@ -286,7 +296,13 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = String::from_utf8(
-            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
         )
         .unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");

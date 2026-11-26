@@ -623,7 +623,9 @@ mod tests {
         assert!(runtime.get().enforce_max_tokens);
 
         // 未传这些字段时保留已保存的值
-        let result = service.update(&admin(), super::tests::request(&service)).unwrap();
+        let result = service
+            .update(&admin(), super::tests::request(&service))
+            .unwrap();
         assert!(result.enforce_max_tokens);
         assert_eq!(result.input_token_source, InputTokenSource::Min);
         assert_eq!(result.prompt_cache_mode, PromptCacheMode::Disabled);
