@@ -193,6 +193,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         account_state.clone(),
+        Some(runtime_config.clone()),
     );
     let admin_service = admin::AdminService::new(
         token_manager.clone(),

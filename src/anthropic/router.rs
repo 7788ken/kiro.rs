@@ -32,10 +32,14 @@ pub fn create_router_with_accounts(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     accounts: AccountState,
+    runtime_config: Option<std::sync::Arc<crate::runtime_config::RuntimeConfig>>,
 ) -> Router {
     let mut state = AppState::new("", extract_thinking).with_accounts(accounts.clone());
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
+    }
+    if let Some(runtime_config) = runtime_config {
+        state = state.with_runtime_config(runtime_config);
     }
 
     let billed_messages = Router::new()

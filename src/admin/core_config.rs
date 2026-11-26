@@ -9,7 +9,7 @@ use crate::anthropic::AppState;
 use crate::http_client::build_client;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::{Config, TlsBackend};
+use crate::model::config::{Config, InputTokenSource, PromptCacheMode, TlsBackend};
 use crate::runtime_config::RuntimeConfig;
 
 use super::error::AdminServiceError;
@@ -33,6 +33,9 @@ pub struct CoreConfigResponse {
     pub proxy_password_set: bool,
     pub site_name: Option<String>,
     pub logo_data_url: Option<String>,
+    pub enforce_max_tokens: bool,
+    pub input_token_source: InputTokenSource,
+    pub prompt_cache_mode: PromptCacheMode,
     pub revision: u64,
 }
 
@@ -61,6 +64,13 @@ pub struct UpdateCoreConfigRequest {
     pub logo_data_url: Option<String>,
     #[serde(default)]
     pub clear_logo: Option<bool>,
+    /// 未传时保留原值，便于旧客户端不覆盖这些开关
+    #[serde(default)]
+    pub enforce_max_tokens: Option<bool>,
+    #[serde(default)]
+    pub input_token_source: Option<InputTokenSource>,
+    #[serde(default)]
+    pub prompt_cache_mode: Option<PromptCacheMode>,
 }
 
 /// 站点名称最大字符数
@@ -130,6 +140,9 @@ impl CoreConfigService {
             proxy_password_set: config.proxy_password.is_some(),
             site_name: config.site_name.clone(),
             logo_data_url: config.logo_data_url.clone(),
+            enforce_max_tokens: config.enforce_max_tokens,
+            input_token_source: config.input_token_source,
+            prompt_cache_mode: config.prompt_cache_mode,
             revision: self.runtime.revision(),
         }
     }
@@ -272,6 +285,15 @@ impl CoreConfigService {
             next.logo_data_url = None;
         } else if let Some(logo) = request.logo_data_url {
             next.logo_data_url = Some(logo);
+        }
+        if let Some(enforce) = request.enforce_max_tokens {
+            next.enforce_max_tokens = enforce;
+        }
+        if let Some(source) = request.input_token_source {
+            next.input_token_source = source;
+        }
+        if let Some(mode) = request.prompt_cache_mode {
+            next.prompt_cache_mode = mode;
         }
         if next.proxy_url.is_none() {
             next.proxy_username = None;
@@ -422,6 +444,9 @@ mod tests {
             site_name: current.site_name,
             logo_data_url: None,
             clear_logo: None,
+            enforce_max_tokens: None,
+            input_token_source: None,
+            prompt_cache_mode: None,
         }
     }
 
@@ -570,5 +595,39 @@ mod tests {
         let mut request = super::tests::request(&service);
         request.site_name = Some("站".repeat(60));
         assert!(service.update(&admin(), request).is_ok());
+    }
+
+    #[test]
+    fn saves_compat_switches_and_keeps_them_when_omitted() {
+        let (service, runtime, _manager, _state, _dir) = service();
+        // 默认：保持原有行为
+        let current = service.get();
+        assert!(!current.enforce_max_tokens);
+        assert_eq!(current.input_token_source, InputTokenSource::Upstream);
+        assert_eq!(current.prompt_cache_mode, PromptCacheMode::Simulated);
+
+        let mut request = request(&service);
+        request.enforce_max_tokens = Some(true);
+        request.input_token_source = Some(InputTokenSource::Min);
+        request.prompt_cache_mode = Some(PromptCacheMode::Disabled);
+        let result = service.update(&admin(), request).unwrap();
+        assert!(result.enforce_max_tokens);
+        assert_eq!(result.input_token_source, InputTokenSource::Min);
+        assert_eq!(result.prompt_cache_mode, PromptCacheMode::Disabled);
+
+        // 落盘并热重载
+        let persisted = Config::load(runtime.path()).unwrap();
+        assert!(persisted.enforce_max_tokens);
+        assert_eq!(persisted.input_token_source, InputTokenSource::Min);
+        assert_eq!(persisted.prompt_cache_mode, PromptCacheMode::Disabled);
+        assert!(runtime.get().enforce_max_tokens);
+
+        // 未传这些字段时保留已保存的值
+        let result = service
+            .update(&admin(), super::tests::request(&service))
+            .unwrap();
+        assert!(result.enforce_max_tokens);
+        assert_eq!(result.input_token_source, InputTokenSource::Min);
+        assert_eq!(result.prompt_cache_mode, PromptCacheMode::Disabled);
     }
 }

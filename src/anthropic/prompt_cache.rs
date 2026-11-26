@@ -65,6 +65,28 @@ impl CacheSplit {
         }
     }
 
+    /// 按配置的口径选定上报总量，再做拆分。
+    ///
+    /// `upstream_total` 是上游上下文占用百分比换算出的值，含整段会话的累计占用；
+    /// `Local` 与 `Min` 用本地估算把它压回本次请求的量级。
+    pub fn apply_with_source(
+        &self,
+        upstream_total: i32,
+        source: crate::model::config::InputTokenSource,
+    ) -> UsageTokens {
+        use crate::model::config::InputTokenSource;
+        let local = self.total_local.clamp(0, i64::from(i32::MAX)) as i32;
+        let total = match source {
+            InputTokenSource::Upstream => upstream_total,
+            // 本地估算为 0（例如空请求）时没有可用口径，退回上游值
+            InputTokenSource::Local if local > 0 => local,
+            InputTokenSource::Local => upstream_total,
+            InputTokenSource::Min if local > 0 => upstream_total.min(local),
+            InputTokenSource::Min => upstream_total,
+        };
+        self.apply(total)
+    }
+
     /// 把本地口径按比例缩放到真实总量 `actual_total`。
     ///
     /// 三者之和 == `actual_total.max(1)`，且 `input_tokens >= 1`
@@ -116,6 +138,22 @@ impl UsageTokens {
 pub fn simulate(payload: &MessagesRequest) -> CacheSplit {
     static CACHE: LazyLock<PromptCache> = LazyLock::new(PromptCache::new);
     CACHE.simulate_at(payload, Instant::now())
+}
+
+/// 按配置模拟缓存：`Disabled` 不读写全局缓存表，输入全部计为普通输入
+pub fn simulate_with_mode(
+    payload: &MessagesRequest,
+    mode: crate::model::config::PromptCacheMode,
+) -> CacheSplit {
+    use crate::model::config::PromptCacheMode;
+    match mode {
+        PromptCacheMode::Simulated => simulate(payload),
+        PromptCacheMode::Disabled => CacheSplit::none(token::count_all_tokens_local(
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i64),
+    }
 }
 
 /// 一个 block 边界：前缀哈希 + 前缀本地 token 数 + 是否为断点（带 `cache_control`）
@@ -212,7 +250,11 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
             stable_json(value).hash(&mut hasher);
             tokens += count(&tool.name) + count(&tool.description);
             tokens += count(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
-            push_boundary(&hasher, tokens, has_cache_control(tool.cache_control.as_ref()));
+            push_boundary(
+                &hasher,
+                tokens,
+                has_cache_control(tool.cache_control.as_ref()),
+            );
         }
     }
 
@@ -222,7 +264,11 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
             let value = serde_json::to_value(block).unwrap_or(Value::Null);
             stable_json(value).hash(&mut hasher);
             tokens += count(&block.text);
-            push_boundary(&hasher, tokens, has_cache_control(block.cache_control.as_ref()));
+            push_boundary(
+                &hasher,
+                tokens,
+                has_cache_control(block.cache_control.as_ref()),
+            );
         }
     }
 
@@ -234,7 +280,11 @@ fn scan_breakpoints(payload: &MessagesRequest) -> (Vec<Boundary>, i64) {
                     message.role.hash(&mut hasher);
                     stable_json(block.clone()).hash(&mut hasher);
                     tokens += block_tokens(block);
-                    push_boundary(&hasher, tokens, has_cache_control(block.get("cache_control")));
+                    push_boundary(
+                        &hasher,
+                        tokens,
+                        has_cache_control(block.get("cache_control")),
+                    );
                 }
             }
             other => {
@@ -383,6 +433,105 @@ mod tests {
     }
 
     #[test]
+    fn input_token_source_picks_reported_total() {
+        use crate::model::config::InputTokenSource;
+        // 本地估算 1000，上游换算值 50000（含整段会话累计占用）
+        let split = CacheSplit::from_parts(1000, 600, 300);
+
+        let upstream = split.apply_with_source(50_000, InputTokenSource::Upstream);
+        let upstream_sum = upstream.input_tokens
+            + upstream.cache_creation_input_tokens
+            + upstream.cache_read_input_tokens;
+        assert_eq!(upstream_sum, 50_000);
+
+        let local = split.apply_with_source(50_000, InputTokenSource::Local);
+        let local_sum =
+            local.input_tokens + local.cache_creation_input_tokens + local.cache_read_input_tokens;
+        assert_eq!(local_sum, 1000, "Local 用本地估算压回本次请求量级");
+
+        let min = split.apply_with_source(50_000, InputTokenSource::Min);
+        let min_sum =
+            min.input_tokens + min.cache_creation_input_tokens + min.cache_read_input_tokens;
+        assert_eq!(min_sum, 1000, "Min 取较小者");
+
+        // 上游值更小时 Min 取上游
+        let min_small = split.apply_with_source(400, InputTokenSource::Min);
+        let min_small_sum = min_small.input_tokens
+            + min_small.cache_creation_input_tokens
+            + min_small.cache_read_input_tokens;
+        assert_eq!(min_small_sum, 400);
+
+        // 本地估算为 0 时退回上游值，避免上报 0
+        let empty = CacheSplit::none(0);
+        for source in [InputTokenSource::Local, InputTokenSource::Min] {
+            let usage = empty.apply_with_source(777, source);
+            assert_eq!(usage.input_tokens, 777, "{source:?} 无本地口径时退回上游");
+        }
+    }
+
+    #[test]
+    fn apply_with_source_keeps_split_invariants() {
+        use crate::model::config::InputTokenSource;
+        // 本地口径取多种比例，上游总量从远大到远小，覆盖 Min/Local 缩小后的拆分
+        for (total_local, read, creation) in [
+            (1000i64, 600i64, 300i64),
+            (1000, 1000, 0),
+            (1000, 0, 1000),
+            (1000, 999, 1),
+            (1, 1, 0),
+            (0, 0, 0),
+        ] {
+            let split = CacheSplit::from_parts(total_local, read, creation);
+            for upstream in [1i32, 2, 7, 500, 50_000, i32::MAX / 2] {
+                for source in [
+                    InputTokenSource::Upstream,
+                    InputTokenSource::Local,
+                    InputTokenSource::Min,
+                ] {
+                    let u = split.apply_with_source(upstream, source);
+                    let sum = i64::from(u.input_tokens)
+                        + i64::from(u.cache_creation_input_tokens)
+                        + i64::from(u.cache_read_input_tokens);
+                    // 1) 普通输入至少 1，避免上报 0
+                    assert!(
+                        u.input_tokens >= 1,
+                        "input_tokens<1: {source:?} upstream={upstream} local={total_local}"
+                    );
+                    // 2) 三项均非负
+                    assert!(u.cache_creation_input_tokens >= 0 && u.cache_read_input_tokens >= 0);
+                    // 3) 之和等于选定的总量（Local/Min 在本地口径为 0 时退回上游值）
+                    let expected = match source {
+                        InputTokenSource::Upstream => i64::from(upstream.max(1)),
+                        _ if total_local == 0 => i64::from(upstream.max(1)),
+                        InputTokenSource::Local => total_local,
+                        InputTokenSource::Min => total_local.min(i64::from(upstream)).max(1),
+                    };
+                    assert_eq!(
+                        sum, expected,
+                        "sum mismatch: {source:?} upstream={upstream} local={total_local} got={u:?}"
+                    );
+                    // 4) 缓存读取不得超过总量
+                    assert!(i64::from(u.cache_read_input_tokens) <= sum);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_mode_reports_all_as_plain_input() {
+        use crate::model::config::PromptCacheMode;
+        let payload = base_request(false);
+        let split = simulate_with_mode(&payload, PromptCacheMode::Disabled);
+        assert_eq!(split.read_local, 0);
+        assert_eq!(split.creation_local, 0);
+        assert_eq!(split.total_local, local_total(&payload));
+        let usage = split.apply(1234);
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
     fn first_request_is_all_creation_then_repeat_is_all_read() {
         let cache = PromptCache::new();
         let payload = base_request(false);
@@ -498,7 +647,10 @@ mod tests {
         let second = cache.simulate_at(&round2, start + Duration::from_secs(30));
         assert!(first.total_local > system_prefix_tokens());
         assert_eq!(second.read_local, first.total_local);
-        assert_eq!(second.creation_local, second.total_local - first.total_local);
+        assert_eq!(
+            second.creation_local,
+            second.total_local - first.total_local
+        );
         assert_eq!(second.total_local, local_total(&round2));
     }
 
@@ -510,7 +662,10 @@ mod tests {
         // 旧断点在本轮最后断点之前 20 个边界：仍在回看范围内，命中
         let cache = PromptCache::new();
         let first = cache.simulate_at(&round1, start);
-        let within = cache.simulate_at(&claude_code_request(5 + 20), start + Duration::from_secs(30));
+        let within = cache.simulate_at(
+            &claude_code_request(5 + 20),
+            start + Duration::from_secs(30),
+        );
         assert_eq!(within.read_local, first.total_local);
 
         // 旧断点在本轮最后断点之前 25 个边界：超出回看范围，回退到 system 断点
@@ -519,7 +674,10 @@ mod tests {
         let round2 = claude_code_request(5 + 25);
         let beyond = cache.simulate_at(&round2, start + Duration::from_secs(30));
         assert_eq!(beyond.read_local, system_prefix_tokens());
-        assert_eq!(beyond.creation_local, beyond.total_local - system_prefix_tokens());
+        assert_eq!(
+            beyond.creation_local,
+            beyond.total_local - system_prefix_tokens()
+        );
     }
 
     fn tool_use_block(id: &str) -> Value {
@@ -556,7 +714,13 @@ mod tests {
                 ]}
             ]
         }));
-        assert!(tool_result_block("toolu_a")["content"].as_str().unwrap().len() >= 2000);
+        assert!(
+            tool_result_block("toolu_a")["content"]
+                .as_str()
+                .unwrap()
+                .len()
+                >= 2000
+        );
         assert!(tool_use_block("toolu_b")["input"].to_string().len() >= 500);
 
         let new_tool_use = tool_use_block("toolu_c");
@@ -598,8 +762,14 @@ mod tests {
         let text = "some words to count here";
         let n = count(text);
         assert_eq!(block_tokens(&json!({"type": "text", "text": text})), n);
-        assert_eq!(block_tokens(&json!({"type": "thinking", "thinking": text})), n);
-        assert_eq!(block_tokens(&json!({"type": "redacted_thinking", "data": text})), n);
+        assert_eq!(
+            block_tokens(&json!({"type": "thinking", "thinking": text})),
+            n
+        );
+        assert_eq!(
+            block_tokens(&json!({"type": "redacted_thinking", "data": text})),
+            n
+        );
         assert_eq!(
             block_tokens(&json!({"type": "tool_result", "content": [
                 {"type": "text", "text": text},
@@ -607,7 +777,10 @@ mod tests {
             ]})),
             n + MEDIA_BLOCK_TOKENS
         );
-        assert_eq!(block_tokens(&json!({"type": "document"})), MEDIA_BLOCK_TOKENS);
+        assert_eq!(
+            block_tokens(&json!({"type": "document"})),
+            MEDIA_BLOCK_TOKENS
+        );
         assert_eq!(block_tokens(&json!({"type": "tool_use"})), 0);
         assert_eq!(block_tokens(&json!({"type": "unknown", "text": text})), 0);
         assert_eq!(block_tokens(&json!({"text": text})), 0);
@@ -616,11 +789,31 @@ mod tests {
     #[test]
     fn apply_sums_to_actual_total_with_input_at_least_one() {
         let cases = [
-            CacheSplit { total_local: 1000, read_local: 1000, creation_local: 0 },
-            CacheSplit { total_local: 1000, read_local: 0, creation_local: 1000 },
-            CacheSplit { total_local: 1000, read_local: 600, creation_local: 300 },
-            CacheSplit { total_local: 1000, read_local: 0, creation_local: 0 },
-            CacheSplit { total_local: 0, read_local: 0, creation_local: 0 },
+            CacheSplit {
+                total_local: 1000,
+                read_local: 1000,
+                creation_local: 0,
+            },
+            CacheSplit {
+                total_local: 1000,
+                read_local: 0,
+                creation_local: 1000,
+            },
+            CacheSplit {
+                total_local: 1000,
+                read_local: 600,
+                creation_local: 300,
+            },
+            CacheSplit {
+                total_local: 1000,
+                read_local: 0,
+                creation_local: 0,
+            },
+            CacheSplit {
+                total_local: 0,
+                read_local: 0,
+                creation_local: 0,
+            },
         ];
         for split in cases {
             for actual in [-5, 0, 1, 2, 3, 7, 999, 1000, 1001, 50_000] {
@@ -638,7 +831,11 @@ mod tests {
 
     #[test]
     fn apply_scales_proportionally() {
-        let split = CacheSplit { total_local: 1000, read_local: 600, creation_local: 300 };
+        let split = CacheSplit {
+            total_local: 1000,
+            read_local: 600,
+            creation_local: 300,
+        };
         let larger = split.apply(2000);
         assert_eq!(larger.cache_read_input_tokens, 1200);
         assert_eq!(larger.cache_creation_input_tokens, 600);
@@ -648,8 +845,16 @@ mod tests {
         assert_eq!(smaller.cache_creation_input_tokens, 30);
         assert_eq!(smaller.input_tokens, 10);
         // 全部命中时给 input 让出 1
-        let all_read = CacheSplit { total_local: 1000, read_local: 1000, creation_local: 0 }.apply(2);
-        assert_eq!((all_read.input_tokens, all_read.cache_read_input_tokens), (1, 1));
+        let all_read = CacheSplit {
+            total_local: 1000,
+            read_local: 1000,
+            creation_local: 0,
+        }
+        .apply(2);
+        assert_eq!(
+            (all_read.input_tokens, all_read.cache_read_input_tokens),
+            (1, 1)
+        );
     }
 
     #[test]

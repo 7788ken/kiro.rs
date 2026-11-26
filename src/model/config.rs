@@ -17,6 +17,33 @@ impl Default for TlsBackend {
     }
 }
 
+/// 上报给客户端的输入 token 口径
+///
+/// 上游 Kiro 只返回上下文占用百分比，乘以窗口大小得到的是整段会话的累计占用，
+/// 不是本次请求的输入量，所以同一会话越聊越高。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputTokenSource {
+    /// 上游上下文占用百分比换算值（原有行为）
+    #[default]
+    Upstream,
+    /// 本地分词估算本次请求的输入量
+    Local,
+    /// 取两者中较小的一个
+    Min,
+}
+
+/// prompt cache 用量的模拟模式
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptCacheMode {
+    /// 按本地断点规则模拟缓存读写（原有行为）
+    #[default]
+    Simulated,
+    /// 不模拟，输入全部计为普通输入，缓存读写恒为 0
+    Disabled,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +148,22 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo_data_url: Option<String>,
 
+    /// 是否在本地强制执行客户端的 `max_tokens`（默认 false）
+    ///
+    /// 上游 Kiro 协议没有 `max_tokens` 字段，客户端传的值只用于预扣，不会约束生成。
+    /// 开启后，输出 token 累计达到该上限时本地停止转发后续内容，并把
+    /// `stop_reason` 置为 `max_tokens`，与 Anthropic 行为一致。
+    #[serde(default)]
+    pub enforce_max_tokens: bool,
+
+    /// 上报输入 token 的口径（默认 upstream，保持原有行为）
+    #[serde(default)]
+    pub input_token_source: InputTokenSource,
+
+    /// 模拟 prompt cache 的模式（默认 simulated，保持原有行为）
+    #[serde(default)]
+    pub prompt_cache_mode: PromptCacheMode,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -199,6 +242,9 @@ impl Default for Config {
             egress_check_url: None,
             site_name: None,
             logo_data_url: None,
+            enforce_max_tokens: false,
+            input_token_source: InputTokenSource::default(),
+            prompt_cache_mode: PromptCacheMode::default(),
             config_path: None,
         }
     }
@@ -271,5 +317,35 @@ impl Config {
         crate::shared_files::atomic_write(path, &content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compat_serde_tests {
+    use super::*;
+
+    #[test]
+    fn compat_switches_serialize_with_expected_names() {
+        let config = Config {
+            enforce_max_tokens: true,
+            input_token_source: InputTokenSource::Min,
+            prompt_cache_mode: PromptCacheMode::Disabled,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["enforceMaxTokens"], true);
+        assert_eq!(json["inputTokenSource"], "min");
+        assert_eq!(json["promptCacheMode"], "disabled");
+
+        // 旧配置文件没有这些字段时取默认值，保持原有行为
+        let legacy: Config = serde_json::from_str(r#"{"region":"us-east-1"}"#).unwrap();
+        assert!(!legacy.enforce_max_tokens);
+        assert_eq!(legacy.input_token_source, InputTokenSource::Upstream);
+        assert_eq!(legacy.prompt_cache_mode, PromptCacheMode::Simulated);
+
+        // kebab-case 枚举值可回读
+        let round: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(round.input_token_source, InputTokenSource::Min);
+        assert_eq!(round.prompt_cache_mode, PromptCacheMode::Disabled);
     }
 }

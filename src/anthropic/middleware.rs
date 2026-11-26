@@ -16,6 +16,27 @@ use crate::{accounts::AccountState, common::auth};
 
 use super::types::ErrorResponse;
 
+/// 请求开始时锁定的兼容开关快照，整个请求期间不变
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestOptions {
+    /// 本地强制执行客户端的 max_tokens
+    pub enforce_max_tokens: bool,
+    /// 上报输入 token 的口径
+    pub input_token_source: crate::model::config::InputTokenSource,
+    /// prompt cache 模拟模式
+    pub prompt_cache_mode: crate::model::config::PromptCacheMode,
+    /// 客户端请求的 max_tokens，`enforce_max_tokens` 开启时作为输出上限
+    pub max_tokens: i32,
+}
+
+impl RequestOptions {
+    /// 带上客户端这次请求的 max_tokens
+    pub fn with_max_tokens(mut self, max_tokens: i32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+}
+
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +50,8 @@ pub struct AppState {
     /// 账户服务，用于用户鉴权和积分计费
     pub accounts: Option<AccountState>,
     pub tracker: crate::admin::RequestTracker,
+    /// 运行时配置，用于读取请求级开关（保存核心配置时整体替换，自动随热重载生效）
+    pub runtime_config: Option<Arc<crate::runtime_config::RuntimeConfig>>,
 }
 
 impl AppState {
@@ -42,6 +65,7 @@ impl AppState {
             )),
             accounts: None,
             tracker: crate::admin::RequestTracker::new(),
+            runtime_config: None,
         }
     }
 
@@ -51,6 +75,31 @@ impl AppState {
         self
     }
 
+    /// 注入运行时配置
+    pub fn with_runtime_config(
+        mut self,
+        runtime_config: Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+
+    /// 请求级开关快照；未注入运行时配置时取默认值
+    pub fn request_options(&self) -> RequestOptions {
+        match &self.runtime_config {
+            Some(runtime) => {
+                let config = runtime.get();
+                RequestOptions {
+                    enforce_max_tokens: config.enforce_max_tokens,
+                    input_token_source: config.input_token_source,
+                    prompt_cache_mode: config.prompt_cache_mode,
+                    max_tokens: 0,
+                }
+            }
+            None => RequestOptions::default(),
+        }
+    }
+
     pub fn with_accounts(mut self, accounts: AccountState) -> Self {
         self.tracker = accounts.tracker.clone();
         self.accounts = Some(accounts);
@@ -58,8 +107,7 @@ impl AppState {
     }
 }
 
-const MANAGER_CHAT_FORBIDDEN: &str =
-    "管理员账户的 API Key 不能调用对话接口，请使用普通用户的 Key";
+const MANAGER_CHAT_FORBIDDEN: &str = "管理员账户的 API Key 不能调用对话接口，请使用普通用户的 Key";
 
 /// 是否为对话接口（`/v1/messages`、`/cc/v1/messages`，不含 `count_tokens`）
 fn is_chat_path(path: &str) -> bool {
@@ -175,7 +223,7 @@ mod tests {
         let accounts =
             AccountState::new(Arc::new(store), ADMIN_KEY).with_legacy_api_key(LEGACY_API_KEY);
         (
-            crate::anthropic::create_router_with_accounts(None, false, accounts),
+            crate::anthropic::create_router_with_accounts(None, false, accounts, None),
             user_key,
         )
     }
@@ -248,7 +296,13 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = String::from_utf8(
-            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
         )
         .unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
