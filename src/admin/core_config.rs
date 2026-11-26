@@ -36,6 +36,8 @@ pub struct CoreConfigResponse {
     pub enforce_max_tokens: bool,
     pub input_token_source: InputTokenSource,
     pub prompt_cache_mode: PromptCacheMode,
+    pub correct_output_for_cache_price: bool,
+    pub output_correction_target: f64,
     pub revision: u64,
 }
 
@@ -71,6 +73,10 @@ pub struct UpdateCoreConfigRequest {
     pub input_token_source: Option<InputTokenSource>,
     #[serde(default)]
     pub prompt_cache_mode: Option<PromptCacheMode>,
+    #[serde(default)]
+    pub correct_output_for_cache_price: Option<bool>,
+    #[serde(default)]
+    pub output_correction_target: Option<f64>,
 }
 
 /// 站点名称最大字符数
@@ -143,6 +149,8 @@ impl CoreConfigService {
             enforce_max_tokens: config.enforce_max_tokens,
             input_token_source: config.input_token_source,
             prompt_cache_mode: config.prompt_cache_mode,
+            correct_output_for_cache_price: config.correct_output_for_cache_price,
+            output_correction_target: config.output_correction_target,
             revision: self.runtime.revision(),
         }
     }
@@ -294,6 +302,17 @@ impl CoreConfigService {
         }
         if let Some(mode) = request.prompt_cache_mode {
             next.prompt_cache_mode = mode;
+        }
+        if let Some(correct) = request.correct_output_for_cache_price {
+            next.correct_output_for_cache_price = correct;
+        }
+        if let Some(target) = request.output_correction_target {
+            if !target.is_finite() || !(0.1..=100.0).contains(&target) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "补正目标倍数必须在 0.1 至 100 之间".into(),
+                ));
+            }
+            next.output_correction_target = target;
         }
         if next.proxy_url.is_none() {
             next.proxy_username = None;
@@ -447,6 +466,8 @@ mod tests {
             enforce_max_tokens: None,
             input_token_source: None,
             prompt_cache_mode: None,
+            correct_output_for_cache_price: None,
+            output_correction_target: None,
         }
     }
 
@@ -595,6 +616,41 @@ mod tests {
         let mut request = super::tests::request(&service);
         request.site_name = Some("站".repeat(60));
         assert!(service.update(&admin(), request).is_ok());
+    }
+
+    #[test]
+    fn saves_output_correction_and_validates_target() {
+        let (service, runtime, _manager, _state, _dir) = service();
+        // 默认关闭、目标倍数 1
+        let current = service.get();
+        assert!(!current.correct_output_for_cache_price);
+        assert_eq!(current.output_correction_target, 1.0);
+
+        let mut request = request(&service);
+        request.correct_output_for_cache_price = Some(true);
+        request.output_correction_target = Some(1.2);
+        let result = service.update(&admin(), request).unwrap();
+        assert!(result.correct_output_for_cache_price);
+        assert_eq!(result.output_correction_target, 1.2);
+        let persisted = Config::load(runtime.path()).unwrap();
+        assert!(persisted.correct_output_for_cache_price);
+        assert_eq!(persisted.output_correction_target, 1.2);
+
+        // 未传时保留
+        let result = service
+            .update(&admin(), super::tests::request(&service))
+            .unwrap();
+        assert!(result.correct_output_for_cache_price);
+        assert_eq!(result.output_correction_target, 1.2);
+
+        // 越界与非法值被拒绝
+        for bad in [0.0, 0.05, 100.1, f64::NAN, f64::INFINITY] {
+            let mut request = super::tests::request(&service);
+            request.output_correction_target = Some(bad);
+            assert_bad_request(service.update(&admin(), request));
+        }
+        // 被拒绝后仍是上一次的有效值
+        assert_eq!(service.get().output_correction_target, 1.2);
     }
 
     #[test]

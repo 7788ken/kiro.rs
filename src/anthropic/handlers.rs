@@ -455,6 +455,38 @@ pub async fn post_messages(
     }
 }
 
+/// 缓存差价补正：开启时把扣费与刊例价的差额折成输出 token
+///
+/// 没有凭证消耗数据时不补，与"不扣费"的口径一致。
+fn correct_output(
+    usage_tokens: &super::prompt_cache::UsageTokens,
+    output_tokens: i32,
+    usage: &CredentialUsage,
+    options: &RequestOptions,
+) -> i32 {
+    if !options.correct_output_for_cache_price {
+        return output_tokens;
+    }
+    let Some(credits) = usage.get() else {
+        return output_tokens;
+    };
+    let ratio = options.billing.consumption_ratio;
+    let ratio = if ratio.is_finite() && ratio > 0.0 {
+        ratio
+    } else {
+        1.0
+    };
+    super::output_correction::corrected_output_tokens(
+        usage_tokens,
+        super::output_correction::CorrectionInput {
+            charged_credits: credits * ratio,
+            output_tokens,
+        },
+        &options.billing,
+        options.output_correction_target,
+    )
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -795,6 +827,11 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let usage_tokens =
+        cache_split.apply_with_source(final_input_tokens, options.input_token_source);
+
+    // 缓存差价补正：把扣费与刊例价的差额折进上报的输出 token
+    let reported_output = correct_output(&usage_tokens, output_tokens, &usage, &options);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -805,9 +842,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": cache_split
-            .apply_with_source(final_input_tokens, options.input_token_source)
-            .to_usage_json(output_tokens)
+        "usage": usage_tokens.to_usage_json(reported_output)
     });
 
     (StatusCode::OK, Json(response_body)).into_response()

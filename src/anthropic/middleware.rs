@@ -17,7 +17,7 @@ use crate::{accounts::AccountState, common::auth};
 use super::types::ErrorResponse;
 
 /// 请求开始时锁定的兼容开关快照，整个请求期间不变
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RequestOptions {
     /// 本地强制执行客户端的 max_tokens
     pub enforce_max_tokens: bool,
@@ -27,6 +27,31 @@ pub struct RequestOptions {
     pub prompt_cache_mode: crate::model::config::PromptCacheMode,
     /// 客户端请求的 max_tokens，`enforce_max_tokens` 开启时作为输出上限
     pub max_tokens: i32,
+    /// 把扣费与刊例价的差额折算成输出 token 上报
+    pub correct_output_for_cache_price: bool,
+    /// 补正目标倍数
+    pub output_correction_target: f64,
+    /// 请求开始时锁定的计费单价与消费倍率，用于折算差额
+    pub billing: crate::accounts::models::BillingConfig,
+}
+
+impl Default for RequestOptions {
+    /// 全部保持现有行为：不强制、不补正，口径与缓存模式用各自的默认值
+    fn default() -> Self {
+        Self {
+            enforce_max_tokens: false,
+            input_token_source: crate::model::config::InputTokenSource::default(),
+            prompt_cache_mode: crate::model::config::PromptCacheMode::default(),
+            max_tokens: 0,
+            correct_output_for_cache_price: false,
+            output_correction_target: 1.0,
+            billing: crate::accounts::models::BillingConfig {
+                input_per_million: 10.0,
+                output_per_million: 50.0,
+                consumption_ratio: 1.0,
+            },
+        }
+    }
 }
 
 impl RequestOptions {
@@ -86,6 +111,13 @@ impl AppState {
 
     /// 请求级开关快照；未注入运行时配置时取默认值
     pub fn request_options(&self) -> RequestOptions {
+        let defaults = RequestOptions::default();
+        // 计费单价在请求开始时一起锁定：补正要用它把差额折成输出
+        let billing = self
+            .accounts
+            .as_ref()
+            .and_then(|accounts| accounts.store.get_billing_config().ok())
+            .unwrap_or(defaults.billing);
         match &self.runtime_config {
             Some(runtime) => {
                 let config = runtime.get();
@@ -94,9 +126,15 @@ impl AppState {
                     input_token_source: config.input_token_source,
                     prompt_cache_mode: config.prompt_cache_mode,
                     max_tokens: 0,
+                    correct_output_for_cache_price: config.correct_output_for_cache_price,
+                    output_correction_target: config.output_correction_target,
+                    billing,
                 }
             }
-            None => RequestOptions::default(),
+            None => RequestOptions {
+                billing,
+                ..defaults
+            },
         }
     }
 

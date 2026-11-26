@@ -1247,11 +1247,43 @@ impl StreamContext {
             self.state_manager.set_stop_reason("tool_use");
         }
 
+        let reported_output = self.reported_output_tokens(&usage);
         events.extend(
             self.state_manager
-                .generate_final_events(usage, self.output_tokens),
+                .generate_final_events(usage, reported_output),
         );
         events
+    }
+
+    /// 上报的输出 token：开启缓存差价补正时把扣费与刊例价的差额折进来。
+    ///
+    /// 扣费锚定凭证真实消耗，而客户端按 usage 和刊例单价自行估算的金额远低于它，
+    /// 差额折成输出补上，输入与缓存三项保持真实。
+    fn reported_output_tokens(&self, usage: &UsageTokens) -> i32 {
+        if !self.options.correct_output_for_cache_price {
+            return self.output_tokens;
+        }
+        let Some(credits) = self.credential_usage.get() else {
+            // 没有凭证消耗数据时不补，与"不扣费"的口径一致
+            return self.output_tokens;
+        };
+        // 与结算口径一致：倍率非法时按 1 处理
+        let ratio = self.options.billing.consumption_ratio;
+        let ratio = if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            1.0
+        };
+        let charged = credits * ratio;
+        super::output_correction::corrected_output_tokens(
+            usage,
+            super::output_correction::CorrectionInput {
+                charged_credits: charged,
+                output_tokens: self.output_tokens,
+            },
+            &self.options.billing,
+            self.options.output_correction_target,
+        )
     }
 }
 
@@ -1952,6 +1984,78 @@ mod tests {
                 "limit={limit} 却上报 {reported}（裁剪与上报口径不一致）"
             );
         }
+    }
+
+    /// 端到端：开启补正后，上报的输出被抬高，输入与缓存三项保持不变
+    #[test]
+    fn output_correction_raises_reported_output_only() {
+        let usage = CredentialUsage::new();
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5-5", 30_000, false, HashMap::new());
+        ctx.set_credential_usage(usage.clone());
+        // 线上典型拆分：缓存读取占大头
+        ctx.set_cache_split(CacheSplit::from_parts(30_000, 20_000, 2_000));
+        ctx.set_options(RequestOptions {
+            correct_output_for_cache_price: true,
+            billing: crate::accounts::models::BillingConfig {
+                input_per_million: 10.0,
+                output_per_million: 50.0,
+                consumption_ratio: 1.0,
+            },
+            ..Default::default()
+        });
+        ctx.process_kiro_event(&assistant_event("hello"));
+        // 凭证消耗远高于刊例估算
+        usage.record(5.0);
+
+        let events = ctx.generate_final_events();
+        let corrected = usage_of(&events, "message_delta");
+        let real_output = ctx.output_tokens;
+        assert!(
+            corrected["output_tokens"].as_i64().unwrap() > i64::from(real_output),
+            "补正应抬高上报输出：{corrected}"
+        );
+
+        // 关闭补正时上报真实输出，且三项输入不受影响
+        let mut plain =
+            StreamContext::new_with_thinking("claude-opus-5-5", 30_000, false, HashMap::new());
+        plain.set_credential_usage(usage.clone());
+        plain.set_cache_split(CacheSplit::from_parts(30_000, 20_000, 2_000));
+        plain.process_kiro_event(&assistant_event("hello"));
+        let plain_events = plain.generate_final_events();
+        let plain_usage = usage_of(&plain_events, "message_delta");
+        assert_eq!(
+            plain_usage["output_tokens"].as_i64().unwrap(),
+            i64::from(plain.output_tokens),
+            "未开启补正时应上报真实输出"
+        );
+        for key in [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            assert_eq!(corrected[key], plain_usage[key], "补正不应改动 {key}");
+        }
+    }
+
+    /// 没有凭证消耗数据时不补
+    #[test]
+    fn output_correction_skipped_without_credential_usage() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5-5", 30_000, false, HashMap::new());
+        ctx.set_cache_split(CacheSplit::from_parts(30_000, 20_000, 2_000));
+        ctx.set_options(RequestOptions {
+            correct_output_for_cache_price: true,
+            ..Default::default()
+        });
+        ctx.process_kiro_event(&assistant_event("hello"));
+        let events = ctx.generate_final_events();
+        let usage = usage_of(&events, "message_delta");
+        assert_eq!(
+            usage["output_tokens"].as_i64().unwrap(),
+            i64::from(ctx.output_tokens),
+            "无凭证消耗时不应补"
+        );
     }
 
     fn usage_of<'a>(events: &'a [SseEvent], name: &str) -> &'a serde_json::Value {
